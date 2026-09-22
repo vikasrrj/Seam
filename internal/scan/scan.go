@@ -113,14 +113,15 @@ func (r *ChunkReader) ReadChunk(ctx context.Context, minID, maxID int64) ([]mode
 
 // NextChunk is the legacy helper that computes the next interval without
 // querying the database. It is kept for callers that do not need sparse-key
-// handling.
+// handling. Ranges never exceed the backfill upper bound and the arithmetic is
+// overflow-safe even when a chunk reaches math.MaxInt64.
 func NextChunk(completedThrough int64, chunkSize int, upperBound int64) (model.ChunkRange, bool) {
-	minID := completedThrough + 1
-	if minID > upperBound {
+	if completedThrough >= upperBound {
 		return model.ChunkRange{}, false
 	}
+	minID := completedThrough + 1
 	maxID := minID + int64(chunkSize) - 1
-	if maxID > upperBound {
+	if maxID > upperBound || maxID < minID {
 		maxID = upperBound
 	}
 	return model.ChunkRange{Min: minID, Max: maxID}, true
