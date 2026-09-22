@@ -82,33 +82,21 @@ crash tests. HTTP endpoints (`/healthz`, `/metrics`, `/progress`) turn on when
 
 ## Production constraints
 
-These follow from the design rather than from missing features, so read them
-before pointing this at anything that matters.
+These follow from the design, so read them before running this in production.
 
-- One processing line. One capture worker, one Kafka partition, one
-  reconciler: throughput and backfill latency are bounded by a single
-  consumer, and nothing scales out horizontally.
-- Convergence is eventual during the backfill. The destination fills chunk by
-  chunk and equals the source only after the cursor passes the scan upper
-  bound and CDC drains. Treat it as a live mirror only once `seam-lab verify`
-  has passed.
+- One processing line. A single capture worker, Kafka partition, and
+  reconciler bound throughput; the destination trails the source until the
+  backfill finishes and `seam-lab verify` passes.
 - Memory scales with chunk size. Each chunk is read into an in-memory
-  candidate map, so `SEAM_CHUNK_SIZE` trades working set against round trips.
-  An oversized chunk can exhaust memory.
-- The source slot holds WAL. While the capture worker is down or slow, the
-  logical slot keeps WAL from being recycled on the source. Size source
-  storage for the longest planned outage and watch confirmed-flush lag.
-- Recovery depends on broker retention. Restart resumes from the checkpointed
-  Kafka offset, so the topic must retain records for the entire outage window.
-  If retention runs out, Seam refuses to start and the backfill has to be
-  redone.
-- Schema changes are coordinated, not absorbed. DDL on the mirrored table
-  trips the fingerprint check and stops the pipeline rather than adapting, so
-  altering the table means a deliberate, coordinated change on both sides
-  plus a restart.
-- Source access is not least-privilege. Replication needs a replication role
-  and `wal_level=logical` on the source, plus DDL rights on the destination
-  for the metadata tables.
+  candidate map, so `SEAM_CHUNK_SIZE` is a straight tradeoff between working
+  set and round trips, and an oversized chunk can exhaust memory.
+- Retention is the recovery contract. A long outage grows WAL behind the
+  source slot, and restart needs the checkpointed Kafka offset still retained
+  by the topic. If the slot is gone or the offset is lost, the backfill has to
+  be redone.
+- Schema changes are coordinated. DDL on the mirrored table trips the
+  fingerprint check and stops the pipeline instead of adapting, so altering
+  the table means a planned change on both sides plus a restart.
 
 ## Configuration (env)
 
