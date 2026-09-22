@@ -75,14 +75,26 @@ source PostgreSQL                Kafka (1 topic, 1 partition)      destination P
 | `SEAM_SOURCE_SLOT` | Replication slot | `seam_slot` |
 | `SEAM_SOURCE_PUBLICATION` | Publication | `seam_pub` |
 | `SEAM_CHUNK_SIZE` | Rows per chunk | `1000` |
+| `SEAM_GENERATION` | Capture generation tag (written into every change and checkpoint) | `gen:0` |
 | `SEAM_HTTP_ADDR` | Optional HTTP address (enables endpoints) | unset |
+
+## Requirements
+
+- Go 1.25+ (`go.mod`), Docker + Docker Compose for the bundled environment, or
+  your own PostgreSQL 16 (with `wal_level=logical`, a replication user) and a
+  Kafka broker.
 
 ## Run
 
 ```bash
-docker-compose up -d        # source:5433, dest:5434, kafka:9092
+docker-compose up -d        # source:5433, dest:5434, kafka:9092 (+ capture service)
 go run ./cmd/seam -start-fresh
 ```
+
+`docker-compose up -d` also boots the **capture** service (`cmd/seam-capture`),
+which creates the replication slot and Kafka topic before `seam` connects. If
+you bring up your own infra instead, run `go run ./cmd/seam-capture` too —
+without capture no CDC ever reaches the topic.
 
 ### Restart / recovery
 
