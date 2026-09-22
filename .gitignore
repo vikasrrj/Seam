@@ -1,0 +1,8 @@
+# built binaries
+/seam
+/seam-capture
+/seam-lab
+
+# test artifacts
+*.test
+*.out
