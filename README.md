@@ -80,16 +80,35 @@ crash tests. HTTP endpoints (`/healthz`, `/metrics`, `/progress`) turn on when
   `seam_applied_txs` records applied source LSNs, and replay from Kafka is safe
   even when one PostgreSQL transaction is split across two poll batches.
 
-## Limitations
+## Production constraints
 
-- One table, fixed schema. No multi-table support, no schema evolution.
-- Primary keys cannot change. An UPDATE that rewrites `id` fails at capture
-  time.
-- TOASTed values are not supported; they error at decode time.
-- One capture worker, one partition, one reconciler.
-- Schema drift past a fingerprint check refuses to start.
-- Transient errors retry with bounded backoff (`internal/retry`); permanent
-  errors stop the process.
+These follow from the design rather than from missing features, so read them
+before pointing this at anything that matters.
+
+- One processing line. One capture worker, one Kafka partition, one
+  reconciler: throughput and backfill latency are bounded by a single
+  consumer, and nothing scales out horizontally.
+- Convergence is eventual during the backfill. The destination fills chunk by
+  chunk and equals the source only after the cursor passes the scan upper
+  bound and CDC drains. Treat it as a live mirror only once `seam-lab verify`
+  has passed.
+- Memory scales with chunk size. Each chunk is read into an in-memory
+  candidate map, so `SEAM_CHUNK_SIZE` trades working set against round trips.
+  An oversized chunk can exhaust memory.
+- The source slot holds WAL. While the capture worker is down or slow, the
+  logical slot keeps WAL from being recycled on the source. Size source
+  storage for the longest planned outage and watch confirmed-flush lag.
+- Recovery depends on broker retention. Restart resumes from the checkpointed
+  Kafka offset, so the topic must retain records for the entire outage window.
+  If retention runs out, Seam refuses to start and the backfill has to be
+  redone.
+- Schema changes are coordinated, not absorbed. DDL on the mirrored table
+  trips the fingerprint check and stops the pipeline rather than adapting, so
+  altering the table means a deliberate, coordinated change on both sides
+  plus a restart.
+- Source access is not least-privilege. Replication needs a replication role
+  and `wal_level=logical` on the source, plus DDL rights on the destination
+  for the metadata tables.
 
 ## Configuration (env)
 
