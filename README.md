@@ -125,6 +125,8 @@ These follow from the design, so read them before running this in production.
 | `SEAM_MAX_IN_MEMORY_CANDIDATES` | Per-chunk candidate map cap | `1000000` |
 | `SEAM_MAX_RECORDS_PER_BATCH` | Cap on records processed per poll batch | `100` |
 | `SEAM_MAX_TX_EVENTS` | Cap on in-flight events of one source transaction (capture) | `1000000` |
+| `SEAM_SOURCE_TABLE` | Source table to backfill | `accounts` |
+| `SEAM_SOURCE_KEY` | Source primary-key column for keyset pagination | `id` |
 | `SEAM_GENERATION` | Generation tag written into changes and checkpoints | `gen:0` |
 | `SEAM_HTTP_ADDR` | Enables HTTP endpoints | unset |
 
@@ -207,8 +209,11 @@ The upgrade is being worked through in phases. Completed phases are marked.
   limits. The capture decoder caps in-flight events of one source transaction,
   the consumer caps records per poll, and the reconciler enforces per-chunk
   candidate and per-batch record limits before processing.
-- [ ] Phase 6 — Scalable PostgreSQL scanning: keyset pagination only,
-  configurable chunk size, multi-key-type support.
+- [x] Phase 6 — Scalable PostgreSQL scanning: keyset pagination only (no
+  OFFSET), configurable chunk size, configurable table and key column with
+  SQL-injection-safe identifier validation, and tests that lock the keyset
+  query shape. UUID/text key support awaits the generalized chunk-range model
+  (Phase 11).
 - [ ] Phase 7 — Adaptive chunking: measure duration/latency and resize chunks.
 - [ ] Phase 8 — Parallel workers: coordinator + multiple workers.
 - [ ] Phase 9 — Chunk leasing with heartbeats and safe reassignment.

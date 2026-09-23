@@ -241,9 +241,9 @@ func (s *Store) LoadCheckpoint(ctx context.Context, jobID string) (*model.Checkp
 
 // JobRecord is the persisted job metadata.
 type JobRecord struct {
-	Config           model.JobConfig
-	Generation       string
-	ScanUpperBound   int64
+	Config            model.JobConfig
+	Generation        string
+	ScanUpperBound    int64
 	SchemaFingerprint string
 }
 
@@ -549,7 +549,16 @@ func scanChunks(rows pgx.Rows) ([]model.Chunk, error) {
 // DiscoverAndCreateChunks scans the source table and persists chunk boundaries
 // for the job. It is idempotent: existing chunks are left untouched.
 func (s *Store) DiscoverAndCreateChunks(ctx context.Context, jobID, attempt string, sourceDSN string, upperBound int64, chunkSize int) error {
-	reader := scan.NewChunkReader(sourceDSN)
+	return s.DiscoverAndCreateChunksFor(ctx, jobID, attempt, sourceDSN, scan.DefaultChunkReaderTable, scan.DefaultChunkReaderKey, upperBound, chunkSize)
+}
+
+// DiscoverAndCreateChunksFor is DiscoverAndCreateChunks with an explicit
+// source table and key column; see scan.NewChunkReaderFor for identifier rules.
+func (s *Store) DiscoverAndCreateChunksFor(ctx context.Context, jobID, attempt string, sourceDSN, sourceTable, sourceKey string, upperBound int64, chunkSize int) error {
+	reader, err := scan.NewChunkReaderFor(sourceDSN, sourceTable, sourceKey)
+	if err != nil {
+		return fmt.Errorf("discover chunks: %w", err)
+	}
 	completedThrough := int64(math.MinInt64)
 
 	for {

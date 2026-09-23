@@ -2,6 +2,7 @@ package scan
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"example.com/seam/internal/model"
@@ -37,5 +38,62 @@ func TestNextChunk(t *testing.T) {
 				t.Fatalf("NextChunk(%d, %d, %d) = %+v, want %+v", tt.completedThrough, tt.chunkSize, tt.upperBound, got, tt.wantChunk)
 			}
 		})
+	}
+}
+
+func TestNewChunkReaderFor_ValidatesIdentifiers(t *testing.T) {
+	valid := []struct{ table, key string }{
+		{"accounts", "id"},
+		{"payments", "account_id"},
+		{"_internal", "_key"},
+	}
+	// Keys must be injected safely; anything but a plain identifier is refused.
+	invalid := []struct{ table, key string }{
+		{"accounts; DROP TABLE accounts", "id"},
+		{"accounts ", "id"},
+		{"public.accounts", "id"},
+		{"accounts", "id; SELECT 1"},
+		{"accounts", "id\"--"},
+		{"accounts", ""},
+		{"", "id"},
+		{"account-list", "id"},
+		{"accounts", "id order by 1"},
+	}
+	for _, v := range valid {
+		if _, err := NewChunkReaderFor("dsn", v.table, v.key); err != nil {
+			t.Fatalf("NewChunkReaderFor(%q, %q) unexpected error: %v", v.table, v.key, err)
+		}
+	}
+	for _, v := range invalid {
+		if _, err := NewChunkReaderFor("dsn", v.table, v.key); err == nil {
+			t.Fatalf("NewChunkReaderFor(%q, %q) expected error", v.table, v.key)
+		}
+	}
+}
+
+func TestKeysetQueriesArePaginationAnchored(t *testing.T) {
+	// The next-chunk query must be keyset based: a strictly-greater-than
+	// predicate anchored on the last key. OFFSET-based pagination degrades as
+	// the table grows and must never appear.
+	q := nextChunkQuery("accounts", "id", 1000)
+	for _, forbidden := range []string{"OFFSET", "offset"} {
+		if strings.Contains(q, forbidden) {
+			t.Fatalf("next chunk query must not use OFFSET: %s", q)
+		}
+	}
+	for _, want := range []string{"id > $1", "ORDER BY id", "LIMIT 1000", "id <= $2"} {
+		if !strings.Contains(q, want) {
+			t.Fatalf("next chunk query missing %q: %s", want, q)
+		}
+	}
+
+	// A custom table/key pair must be reflected verbatim in the SQL.
+	q2 := nextChunkQuery("payments", "account_id", 50)
+	if !strings.Contains(q2, "payments") || !strings.Contains(q2, "account_id > $1") {
+		t.Fatalf("custom table/key not applied: %s", q2)
+	}
+	up := upperBoundQuery("payments", "account_id")
+	if up != "SELECT MAX(account_id) FROM payments" {
+		t.Fatalf("unexpected upper bound query: %s", up)
 	}
 }

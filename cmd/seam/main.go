@@ -31,6 +31,8 @@ type config struct {
 	SourceReplDSN         string
 	SourceSlot            string
 	SourcePublication     string
+	SourceTable           string
+	SourceKey             string
 	DestDSN               string
 	KafkaBrokers          []string
 	KafkaTopic            string
@@ -82,7 +84,11 @@ func run(ctx context.Context, cfg config) error {
 			MaxInMemoryCandidates: cfg.MaxInMemoryCandidates,
 			MaxRecordsPerBatch:    cfg.MaxRecordsPerBatch,
 		}
-		upperBound, err := scan.NewChunkReader(cfg.SourceDSN).UpperBound(ctx)
+		upperBoundReader, err := scan.NewChunkReaderFor(cfg.SourceDSN, cfg.SourceTable, cfg.SourceKey)
+		if err != nil {
+			return fmt.Errorf("configure source scan: %w", err)
+		}
+		upperBound, err := upperBoundReader.UpperBound(ctx)
 		if err != nil {
 			return fmt.Errorf("determine scan upper bound: %w", err)
 		}
@@ -90,7 +96,7 @@ func run(ctx context.Context, cfg config) error {
 		if err != nil {
 			return fmt.Errorf("create job: %w", err)
 		}
-		if err := cpStore.DiscoverAndCreateChunks(ctx, cfg.JobID, cp.Attempt, cfg.SourceDSN, upperBound, cfg.ChunkSize); err != nil {
+		if err := cpStore.DiscoverAndCreateChunksFor(ctx, cfg.JobID, cp.Attempt, cfg.SourceDSN, cfg.SourceTable, cfg.SourceKey, upperBound, cfg.ChunkSize); err != nil {
 			return fmt.Errorf("discover chunks: %w", err)
 		}
 	} else {
@@ -122,6 +128,11 @@ func run(ctx context.Context, cfg config) error {
 	}
 	defer consumer.Close()
 
+	paginator, err := scan.NewChunkReaderFor(cfg.SourceDSN, cfg.SourceTable, cfg.SourceKey)
+	if err != nil {
+		return fmt.Errorf("configure source scan: %w", err)
+	}
+
 	metrics := telemetry.NewMetrics()
 
 	if addr := os.Getenv("SEAM_HTTP_ADDR"); addr != "" {
@@ -149,7 +160,7 @@ func run(ctx context.Context, cfg config) error {
 		CheckpointStore: cpStore,
 		ChunkStore:      cpStore,
 		MarkerStore:     markerStore,
-		Scanner:         scan.NewChunkReader(cfg.SourceDSN),
+		Scanner:         paginator,
 		Sink:            sink.NewMutator(),
 		Metrics:         metrics,
 	})
@@ -170,6 +181,8 @@ func loadConfig() config {
 		SourceReplDSN:         envOrDefault("SOURCE_REPLICATION_DSN", "postgres://postgres:postgres@localhost:5433/source?sslmode=disable&replication=database"),
 		SourceSlot:            envOrDefault("SEAM_SOURCE_SLOT", "seam_slot"),
 		SourcePublication:     envOrDefault("SEAM_SOURCE_PUBLICATION", "seam_pub"),
+		SourceTable:           envOrDefault("SEAM_SOURCE_TABLE", scan.DefaultChunkReaderTable),
+		SourceKey:             envOrDefault("SEAM_SOURCE_KEY", scan.DefaultChunkReaderKey),
 		DestDSN:               envOrDefault("DEST_SQL_DSN", "postgres://postgres:postgres@localhost:5434/dest?sslmode=disable"),
 		KafkaBrokers:          splitAndTrim(envOrDefault("KAFKA_BROKERS", "localhost:9092")),
 		KafkaTopic:            envOrDefault("KAFKA_TOPIC", "seam.accounts"),
