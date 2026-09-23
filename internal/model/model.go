@@ -91,6 +91,10 @@ type JobConfig struct {
 	// MaxRecordsPerBatch bounds how many Kafka records are processed at once.
 	// 0 means unlimited (unit-test default).
 	MaxRecordsPerBatch int
+	// Workers is the number of concurrent chunk workers. Values greater than
+	// one switch the reconciler into coordinator + worker pool mode (requires a
+	// durable chunk store; the legacy scanner loop stays sequential).
+	Workers int
 }
 
 // Checkpoint is the durable progress state for a job.

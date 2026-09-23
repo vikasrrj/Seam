@@ -42,6 +42,7 @@ type config struct {
 	LeaseDuration         time.Duration
 	MaxInMemoryCandidates int
 	MaxRecordsPerBatch    int
+	Workers               int
 	AdaptiveChunking      bool
 	TargetChunkDuration   time.Duration
 	ChunkSizeMin          int
@@ -171,6 +172,7 @@ func run(ctx context.Context, cfg config) error {
 			LeaseDuration:         cfg.LeaseDuration,
 			MaxInMemoryCandidates: cfg.MaxInMemoryCandidates,
 			MaxRecordsPerBatch:    cfg.MaxRecordsPerBatch,
+			Workers:               cfg.Workers,
 		},
 		Checkpoint:      cp,
 		Consumer:        consumer,
@@ -212,6 +214,7 @@ func loadConfig() config {
 		LeaseDuration:         durationEnvOrDefault("SEAM_LEASE_DURATION", 30*time.Second),
 		MaxInMemoryCandidates: intEnvOrDefault("SEAM_MAX_IN_MEMORY_CANDIDATES", 1_000_000),
 		MaxRecordsPerBatch:    intEnvOrDefault("SEAM_MAX_RECORDS_PER_BATCH", 100),
+		Workers:               intEnvOrDefault("SEAM_WORKERS", 1),
 		AdaptiveChunking:      boolEnvOrDefault("SEAM_ADAPTIVE_CHUNKING", false),
 		TargetChunkDuration:   durationEnvOrDefault("SEAM_TARGET_CHUNK_DURATION", 5*time.Second),
 		ChunkSizeMin:          intEnvOrDefault("SEAM_CHUNK_SIZE_MIN", 100),

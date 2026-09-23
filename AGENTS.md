@@ -56,6 +56,7 @@ stale snapshot.
 
 - Phase 1 (backfill correctness), Phase 2 (durable chunk state), Phase 3 (crash
   recovery), Phase 4 (atomic chunk completion), Phase 5 (bounded memory),
-  Phase 6 (scalable scanning), and Phase 7 (adaptive chunking) are implemented
-  and covered by unit tests.
+  Phase 6 (scalable scanning), Phase 7 (adaptive chunking), and Phase 8
+  (parallel workers: coordinator + worker pool, `SEAM_WORKERS`, chunk-ordered
+  commits, pending-eviction sets) are implemented and covered by unit tests.
 - Remaining phases are listed in `README.md` under Roadmap.

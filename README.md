@@ -124,6 +124,7 @@ These follow from the design, so read them before running this in production.
 | `SEAM_LEASE_DURATION` | Chunk lease TTL | `30s` |
 | `SEAM_MAX_IN_MEMORY_CANDIDATES` | Per-chunk candidate map cap | `1000000` |
 | `SEAM_MAX_RECORDS_PER_BATCH` | Cap on records processed per poll batch | `100` |
+| `SEAM_WORKERS` | Concurrent chunk workers (>1 enables coordinator + worker pool; requires durable chunk state) | `1` |
 | `SEAM_MAX_TX_EVENTS` | Cap on in-flight events of one source transaction (capture) | `1000000` |
 | `SEAM_SOURCE_TABLE` | Source table to backfill | `accounts` |
 | `SEAM_SOURCE_KEY` | Source primary-key column for keyset pagination | `id` |
@@ -226,7 +227,14 @@ The upgrade is being worked through in phases. Completed phases are marked.
   `SEAM_TARGET_CHUNK_DURATION`, `SEAM_CHUNK_SIZE_MIN/MAX`. Supports crash
   recovery unchanged. The coordinator phases (8-10) will extend this to
   wave-based durable-chunk discovery.
-- [ ] Phase 8 — Parallel workers: coordinator + multiple workers.
+- [x] Phase 8 — Parallel workers: a coordinator owns the single Kafka consumer,
+  every `r.cp` mutation, and in-order chunk commits; N workers lease chunks
+  from the durable store, register their window (LOW marker) before scanning,
+  and deliver snapshot candidates over a channel. Each window keeps a pending
+  evicted set so markers/events consumed before the scan finishes are never
+  lost, and commits are gated in chunk order so `completed_through` never
+  regresses. Enabled with `SEAM_WORKERS` (default 1 = unchanged sequential
+  path; requires durable chunk state, i.e. `SEAM_ADAPTIVE_CHUNKING=off`).
 - [ ] Phase 9 — Chunk leasing with heartbeats and safe reassignment.
 - [ ] Phase 10 — Coordinator: job creation, scheduling, progress, pause/resume/cancel.
 - [ ] Phase 11 — Multi-table backfills.

@@ -73,7 +73,7 @@ func ResetTables(ctx context.Context) error {
 		// ignore: slot may not exist
 	}
 
-	if _, err := dst.Exec(ctx, `TRUNCATE accounts, seam_jobs, seam_checkpoints, seam_applied_txs`); err != nil {
+	if _, err := dst.Exec(ctx, `TRUNCATE accounts, seam_jobs, seam_checkpoints, seam_applied_txs, seam_chunks`); err != nil {
 		return fmt.Errorf("truncate dest: %w", err)
 	}
 

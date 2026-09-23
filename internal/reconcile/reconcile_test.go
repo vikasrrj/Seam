@@ -737,14 +737,14 @@ func TestReconciler_MarkerStateMachineErrors(t *testing.T) {
 		{
 			name: "high before low",
 			batches: [][]kafka.Record{{
-				rec(0, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 2})),
+				rec(0, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 1})),
 			}},
 		},
 		{
 			name: "duplicate low",
 			batches: [][]kafka.Record{{
-				rec(0, lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 2})),
-				rec(1, lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 2})),
+				rec(0, lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 1})),
+				rec(1, lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 1})),
 			}},
 		},
 	}

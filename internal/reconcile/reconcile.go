@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	"example.com/seam/internal/capture"
@@ -32,12 +31,6 @@ type Reconciler struct {
 	metrics         *telemetry.Metrics
 	codec           capture.JSONCodec
 	disableEviction bool
-
-	// mutable state protected by mu during a chunk
-	mu          sync.Mutex
-	chunk       model.ChunkRange
-	candidates  map[int64]model.Account
-	windowState WindowState
 }
 
 // consumer reads decoded Kafka records.
@@ -145,6 +138,9 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	log.Printf("seam: starting job=%s generation=%s attempt=%s completed_through=%d upper_bound=%d next_offset=%d",
 		r.cp.JobID, r.cp.Generation, r.cp.Attempt, r.cp.CompletedThrough, r.cp.ScanUpperBound, r.cp.NextKafkaOffset)
 
+	if r.chunkStore != nil && r.cfg.Workers > 1 {
+		return r.runParallelWorkers(ctx)
+	}
 	if r.chunkStore != nil {
 		return r.runChunkStoreLoop(ctx)
 	}
@@ -229,10 +225,7 @@ func (r *Reconciler) runCDCOnly(ctx context.Context) error {
 // runChunk executes one reconciliation window.
 func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 	chunkRange := chunk.Range()
-	r.mu.Lock()
-	r.chunk = chunkRange
-	r.windowState = OutsideWindow
-	r.mu.Unlock()
+	w := &window{chunk: chunkRange, state: OutsideWindow}
 
 	log.Printf("seam: chunk %s starting", chunkRange)
 	chunkStart := time.Now()
@@ -261,12 +254,12 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 	if n := len(rows); r.cfg.MaxInMemoryCandidates > 0 && n > r.cfg.MaxInMemoryCandidates {
 		return fmt.Errorf("chunk %s read %d rows exceeds max in-memory candidates %d", chunkRange, n, r.cfg.MaxInMemoryCandidates)
 	}
-	r.mu.Lock()
-	r.candidates = make(map[int64]model.Account, len(rows))
+	w.mu.Lock()
+	w.candidates = make(map[int64]model.Account, len(rows))
 	for _, account := range rows {
-		r.candidates[account.ID] = account
+		w.candidates[account.ID] = account
 	}
-	r.mu.Unlock()
+	w.mu.Unlock()
 	log.Printf("seam: chunk %s read %d candidates", chunkRange, len(rows))
 
 	if r.chunkStore != nil {
@@ -306,7 +299,7 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 		if len(records) == 0 {
 			continue
 		}
-		done, err := r.processChunkRecords(ctx, records, chunk)
+		done, err := r.processChunkRecords(ctx, records, chunk, w)
 		if err != nil {
 			return err
 		}
@@ -337,33 +330,33 @@ func (r *Reconciler) updateChunkState(ctx context.Context, chunk *model.Chunk) e
 
 // processChunkRecords applies a batch of Kafka records while inside a chunk.
 // It returns true when the chunk is complete.
-func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Record, chunk *model.Chunk) (bool, error) {
+func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Record, chunk *model.Chunk, w *window) (bool, error) {
 	if err := r.checkBatchBounds(records); err != nil {
 		return false, err
 	}
-	r.mu.Lock()
-	state := r.windowState
-	r.mu.Unlock()
+	w.mu.Lock()
+	state := w.state
+	w.mu.Unlock()
 
 	// Group records by source transaction.
 	groups := groupByTransaction(records)
 
 	for idx, group := range groups {
 		// Determine the effective window state for this group based on markers.
-		newState, err := r.evaluateMarkers(group, state)
+		newState, err := r.evaluateMarkers(group, w)
 		if err != nil {
 			return false, err
 		}
 		state = newState
 
-		r.mu.Lock()
-		r.windowState = state
-		r.mu.Unlock()
+		w.mu.Lock()
+		w.state = state
+		w.mu.Unlock()
 
 		// If the group contains the HIGH marker for the current attempt, the
 		// chunk completion transaction includes surviving candidates.
 		if state == CompletingWindow {
-			if err := r.completeChunk(ctx, group, chunk); err != nil {
+			if err := r.completeChunk(ctx, group, chunk, w); err != nil {
 				return false, err
 			}
 			// Drain any remaining groups in this batch in CDC-only mode. They
@@ -376,10 +369,10 @@ func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Re
 				} else if skip {
 					continue
 				}
-				if _, err := r.evaluateMarkers(g, OutsideWindow); err != nil {
+				if _, err := r.evaluateMarkers(g, w); err != nil {
 					return false, err
 				}
-				if err := r.applySourceTransaction(ctx, g, false); err != nil {
+				if err := r.applySourceTransaction(ctx, g, nil); err != nil {
 					return false, err
 				}
 			}
@@ -388,7 +381,7 @@ func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Re
 
 		// Otherwise apply the source transaction normally, evicting candidates
 		// that are touched while inside the window.
-		if err := r.applySourceTransaction(ctx, group, state == InsideWindow); err != nil {
+		if err := r.applySourceTransaction(ctx, group, w); err != nil {
 			return false, err
 		}
 	}
@@ -412,8 +405,10 @@ func (r *Reconciler) skipAlreadyCompletedGroup(group []kafka.Record) (bool, erro
 }
 
 // evaluateMarkers scans a transaction group for markers belonging to the
-// current attempt and updates the window state.
-func (r *Reconciler) evaluateMarkers(group []kafka.Record, state WindowState) (WindowState, error) {
+// current attempt and the given window's chunk range, and updates the window
+// state. Markers from other chunks or previous attempts are ignored so
+// overlapping windows on the shared stream do not interfere.
+func (r *Reconciler) evaluateMarkers(group []kafka.Record, w *window) (WindowState, error) {
 	for _, rec := range group {
 		if rec.Change.Marker == nil {
 			continue
@@ -423,32 +418,44 @@ func (r *Reconciler) evaluateMarkers(group []kafka.Record, state WindowState) (W
 			// Stale marker from a previous attempt; ignore.
 			continue
 		}
+		if marker.ChunkMin != w.chunk.Min || marker.ChunkMax != w.chunk.Max {
+			// Marker for a different window; ignore.
+			continue
+		}
 		switch marker.Kind {
 		case model.MarkerLow:
-			if state != OutsideWindow {
-				return state, fmt.Errorf("unexpected LOW marker %s in state %d (window chunk=%s)", marker.ID, state, r.chunk)
+			if w.state != OutsideWindow {
+				return w.state, fmt.Errorf("unexpected LOW marker %s in state %d (window chunk=%s)", marker.ID, w.state, w.chunk)
 			}
-			state = InsideWindow
+			w.state = InsideWindow
 		case model.MarkerHigh:
-			if state != InsideWindow {
-				return state, fmt.Errorf("unexpected HIGH marker %s in state %d (window chunk=%s)", marker.ID, state, r.chunk)
+			if w.state != InsideWindow {
+				return w.state, fmt.Errorf("unexpected HIGH marker %s in state %d (window chunk=%s)", marker.ID, w.state, w.chunk)
 			}
-			state = CompletingWindow
+			w.state = CompletingWindow
 		default:
-			return state, fmt.Errorf("unknown marker kind %q", marker.Kind)
+			return w.state, fmt.Errorf("unknown marker kind %q", marker.Kind)
 		}
 	}
-	return state, nil
+	return w.state, nil
 }
 
 // applySourceTransaction applies one source transaction worth of Kafka records
-// to the destination. When inside the reconciliation window, any touched
-// candidate key is removed from the candidate map.
-func (r *Reconciler) applySourceTransaction(ctx context.Context, group []kafka.Record, insideWindow bool) error {
+// to the destination. When inside a reconciliation window, any touched
+// candidate key is removed from the window's candidate map. Passing a nil
+// window applies the transaction without eviction (CDC-only mode).
+func (r *Reconciler) applySourceTransaction(ctx context.Context, group []kafka.Record, w *window) error {
 	if len(group) == 0 {
 		return nil
 	}
 	source := group[0].Change.Source
+
+	insideWindow := false
+	if w != nil {
+		w.mu.Lock()
+		insideWindow = w.state == InsideWindow
+		w.mu.Unlock()
+	}
 
 	tx, err := r.cpStore.Begin(ctx)
 	if err != nil {
@@ -463,7 +470,7 @@ func (r *Reconciler) applySourceTransaction(ctx context.Context, group []kafka.R
 	// always safe. MarkApplied still records the LSN for bookkeeping.
 	cdcCount := 0
 	for _, rec := range group {
-		if err := r.applyChange(ctx, tx, rec.Change, insideWindow); err != nil {
+		if err := r.applyChange(ctx, tx, rec.Change, insideWindow, w); err != nil {
 			return err
 		}
 		if rec.Change.Account != nil {
@@ -489,14 +496,14 @@ func (r *Reconciler) applySourceTransaction(ctx context.Context, group []kafka.R
 }
 
 // applyChange applies one change. If insideWindow and the change touches a
-// candidate key, that candidate is evicted.
-func (r *Reconciler) applyChange(ctx context.Context, tx pgx.Tx, change model.Change, insideWindow bool) error {
+// candidate key, that candidate is evicted from the window.
+func (r *Reconciler) applyChange(ctx context.Context, tx pgx.Tx, change model.Change, insideWindow bool, w *window) error {
 	switch {
 	case change.Account != nil:
-		if insideWindow && !r.disableEviction {
-			r.mu.Lock()
-			delete(r.candidates, change.Account.ID)
-			r.mu.Unlock()
+		if insideWindow && !r.disableEviction && w != nil {
+			w.mu.Lock()
+			w.evictLocked(change.Account.ID)
+			w.mu.Unlock()
 		}
 		return r.sink.Apply(ctx, tx, change)
 	case change.Marker != nil:
@@ -517,7 +524,7 @@ func (r *Reconciler) applyChange(ctx context.Context, tx pgx.Tx, change model.Ch
 // If the process crashes before commit, the transaction rolls back and the
 // chunk remains in its previous state; recovery will retry it under a new
 // attempt without ever exposing a partially-completed chunk.
-func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record, chunk *model.Chunk) error {
+func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record, chunk *model.Chunk, w *window) error {
 	if err := r.maybeWait(ctx, failpoint.AfterHighMarkerObserved); err != nil {
 		return err
 	}
@@ -547,9 +554,9 @@ func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record
 		if rec.Change.Account != nil {
 			cdcCount++
 			if !r.disableEviction {
-				r.mu.Lock()
-				delete(r.candidates, rec.Change.Account.ID)
-				r.mu.Unlock()
+				w.mu.Lock()
+				w.evictLocked(rec.Change.Account.ID)
+				w.mu.Unlock()
 			}
 			if err := r.sink.Apply(ctx, tx, rec.Change); err != nil {
 				return err
@@ -567,14 +574,14 @@ func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record
 		return err
 	}
 
-	r.mu.Lock()
-	candidateCount := len(r.candidates)
+	w.mu.Lock()
+	candidateCount := len(w.candidates)
 	survivors := make([]model.Account, 0, candidateCount)
-	for _, account := range r.candidates {
+	for _, account := range w.candidates {
 		survivors = append(survivors, account)
 	}
-	r.candidates = nil
-	r.mu.Unlock()
+	w.candidates = nil
+	w.mu.Unlock()
 
 	if r.chunkStore != nil {
 		chunk.RowsApplied = int64(cdcCount)
@@ -584,7 +591,7 @@ func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record
 		return fmt.Errorf("write survivors: %w", err)
 	}
 
-	r.cp.CompletedThrough = r.chunk.Max
+	r.cp.CompletedThrough = w.chunk.Max
 	lastOffset := highGroup[len(highGroup)-1].Offset
 	if err := r.updateCheckpoint(ctx, tx, lastOffset, source.LSN); err != nil {
 		return err
@@ -604,7 +611,7 @@ func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record
 		return err
 	}
 
-	log.Printf("seam: chunk %s complete survivors=%d", r.chunk, len(survivors))
+	log.Printf("seam: chunk %s complete survivors=%d", w.chunk, len(survivors))
 	r.metrics.RecordChunk(telemetry.ChunkStats{Candidates: candidateCount, Survivors: len(survivors)})
 	return nil
 }
@@ -625,7 +632,7 @@ func (r *Reconciler) flushBatch(ctx context.Context, records []kafka.Record) err
 	}
 	groups := groupByTransaction(records)
 	for _, group := range groups {
-		if err := r.applySourceTransaction(ctx, group, false); err != nil {
+		if err := r.applySourceTransaction(ctx, group, nil); err != nil {
 			return err
 		}
 	}
