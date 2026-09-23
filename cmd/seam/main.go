@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"example.com/seam/internal/adaptive"
 	"example.com/seam/internal/capture"
 	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/kafka"
@@ -41,6 +42,10 @@ type config struct {
 	LeaseDuration         time.Duration
 	MaxInMemoryCandidates int
 	MaxRecordsPerBatch    int
+	AdaptiveChunking      bool
+	TargetChunkDuration   time.Duration
+	ChunkSizeMin          int
+	ChunkSizeMax          int
 	StartFresh            bool
 }
 
@@ -96,8 +101,13 @@ func run(ctx context.Context, cfg config) error {
 		if err != nil {
 			return fmt.Errorf("create job: %w", err)
 		}
-		if err := cpStore.DiscoverAndCreateChunksFor(ctx, cfg.JobID, cp.Attempt, cfg.SourceDSN, cfg.SourceTable, cfg.SourceKey, upperBound, cfg.ChunkSize); err != nil {
-			return fmt.Errorf("discover chunks: %w", err)
+		// Adaptive chunking resizes chunks from measured latency and currently
+		// drives the scanner directly; pre-discovering fixed-size chunks would
+		// contradict the adaptive size, so they are skipped in this mode.
+		if !cfg.AdaptiveChunking {
+			if err := cpStore.DiscoverAndCreateChunksFor(ctx, cfg.JobID, cp.Attempt, cfg.SourceDSN, cfg.SourceTable, cfg.SourceKey, upperBound, cfg.ChunkSize); err != nil {
+				return fmt.Errorf("discover chunks: %w", err)
+			}
 		}
 	} else {
 		result, err := recovery.Recover(ctx, cpStore, cfg.JobID, cfg.SourceDSN)
@@ -139,7 +149,14 @@ func run(ctx context.Context, cfg config) error {
 		server.Start(ctx, addr, metrics, cpStore, cfg.JobID)
 	}
 
-	reconciler := reconcile.New(reconcile.Config{
+	// Adaptive chunking runs the scanner loop (no durable chunk store) so the
+	// per-chunk latency feedback can resize chunks on the fly.
+	var sizer *adaptive.Sizer
+	if cfg.AdaptiveChunking {
+		sizer = adaptive.NewSizer(cfg.TargetChunkDuration, cfg.ChunkSize, cfg.ChunkSizeMin, cfg.ChunkSizeMax)
+	}
+
+	reconcilerCfg := reconcile.Config{
 		JobConfig: model.JobConfig{
 			JobID:                 cfg.JobID,
 			SourceDSN:             cfg.SourceDSN,
@@ -158,12 +175,16 @@ func run(ctx context.Context, cfg config) error {
 		Checkpoint:      cp,
 		Consumer:        consumer,
 		CheckpointStore: cpStore,
-		ChunkStore:      cpStore,
 		MarkerStore:     markerStore,
 		Scanner:         paginator,
 		Sink:            sink.NewMutator(),
+		Adaptive:        sizer,
 		Metrics:         metrics,
-	})
+	}
+	if !cfg.AdaptiveChunking {
+		reconcilerCfg.ChunkStore = cpStore
+	}
+	reconciler := reconcile.New(reconcilerCfg)
 
 	return reconciler.Run(ctx)
 }
@@ -191,6 +212,10 @@ func loadConfig() config {
 		LeaseDuration:         durationEnvOrDefault("SEAM_LEASE_DURATION", 30*time.Second),
 		MaxInMemoryCandidates: intEnvOrDefault("SEAM_MAX_IN_MEMORY_CANDIDATES", 1_000_000),
 		MaxRecordsPerBatch:    intEnvOrDefault("SEAM_MAX_RECORDS_PER_BATCH", 100),
+		AdaptiveChunking:      boolEnvOrDefault("SEAM_ADAPTIVE_CHUNKING", false),
+		TargetChunkDuration:   durationEnvOrDefault("SEAM_TARGET_CHUNK_DURATION", 5*time.Second),
+		ChunkSizeMin:          intEnvOrDefault("SEAM_CHUNK_SIZE_MIN", 100),
+		ChunkSizeMax:          intEnvOrDefault("SEAM_CHUNK_SIZE_MAX", 1_000_000),
 	}
 	flag.BoolVar(&cfg.StartFresh, "start-fresh", false, "Create a new job instead of recovering")
 	flag.Parse()
@@ -234,6 +259,20 @@ func durationEnvOrDefault(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+func boolEnvOrDefault(name string, fallback bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if v == "" {
+		return fallback
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return fallback
 }
 
 func splitAndTrim(value string) []string {

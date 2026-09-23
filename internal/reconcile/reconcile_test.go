@@ -1158,3 +1158,53 @@ func TestBoundedMemory_DefaultsUnlimited(t *testing.T) {
 		t.Fatalf("expected 2 survivors, got %v", sink.survivorIDs())
 	}
 }
+
+// fakeChunkSizer records adaptive sizing interactions for tests.
+type fakeChunkSizer struct {
+	mu          sync.Mutex
+	size        int
+	suggestions int
+	observes    []time.Duration
+}
+
+func (s *fakeChunkSizer) Suggest() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.suggestions++
+	return s.size
+}
+
+func (s *fakeChunkSizer) Observe(d time.Duration, rows int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observes = append(s.observes, d)
+}
+
+// TestAdaptiveChunkSizeConsulted verifies the legacy loop asks the adaptive
+// sizer for each chunk size and feeds completed-chunk durations back to it.
+func TestAdaptiveChunkSizeConsulted(t *testing.T) {
+	rows := map[int64]model.Account{
+		1: account(1, "one", 100),
+		2: account(2, "two", 200),
+	}
+	chunk := model.ChunkRange{Min: 1, Max: 2}
+	cfg, sink, _, _ := setup(rows, 10, [][]kafka.Record{chunkBatch("test-job", "gen:0:attempt:0", chunk)})
+
+	sizer := &fakeChunkSizer{size: 10}
+	cfg.Adaptive = sizer
+
+	if err := runReconciler(t, cfg, 5*time.Second); err != nil {
+		t.Fatalf("run reconciler: %v", err)
+	}
+	if len(sink.survivorIDs()) != 2 {
+		t.Fatalf("expected 2 survivors, got %v", sink.survivorIDs())
+	}
+	sizer.mu.Lock()
+	defer sizer.mu.Unlock()
+	if sizer.suggestions == 0 {
+		t.Fatal("adaptive sizer was never asked for a chunk size")
+	}
+	if len(sizer.observes) != 1 {
+		t.Fatalf("expected 1 completed-chunk observation, got %d", len(sizer.observes))
+	}
+}

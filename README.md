@@ -127,6 +127,10 @@ These follow from the design, so read them before running this in production.
 | `SEAM_MAX_TX_EVENTS` | Cap on in-flight events of one source transaction (capture) | `1000000` |
 | `SEAM_SOURCE_TABLE` | Source table to backfill | `accounts` |
 | `SEAM_SOURCE_KEY` | Source primary-key column for keyset pagination | `id` |
+| `SEAM_ADAPTIVE_CHUNKING` | Resize chunks from measured latency (scanner mode) | `false` |
+| `SEAM_TARGET_CHUNK_DURATION` | Target per-chunk duration for adaptive sizing | `5s` |
+| `SEAM_CHUNK_SIZE_MIN` | Adaptive lower bound (rows) | `100` |
+| `SEAM_CHUNK_SIZE_MAX` | Adaptive upper bound (rows) | `1000000` |
 | `SEAM_GENERATION` | Generation tag written into changes and checkpoints | `gen:0` |
 | `SEAM_HTTP_ADDR` | Enables HTTP endpoints | unset |
 
@@ -214,7 +218,14 @@ The upgrade is being worked through in phases. Completed phases are marked.
   SQL-injection-safe identifier validation, and tests that lock the keyset
   query shape. UUID/text key support awaits the generalized chunk-range model
   (Phase 11).
-- [ ] Phase 7 — Adaptive chunking: measure duration/latency and resize chunks.
+- [x] Phase 7 — Adaptive chunking: a duration-feedback controller
+  (`internal/adaptive`) measures completed-chunk latency on a 32-sample sliding
+  window, clamps each step to half/double, and resizes the next chunk toward a
+  target duration with hard min/max bounds. Wired into the reconciler's
+  scanner loop and configurable via `SEAM_ADAPTIVE_CHUNKING`,
+  `SEAM_TARGET_CHUNK_DURATION`, `SEAM_CHUNK_SIZE_MIN/MAX`. Supports crash
+  recovery unchanged. The coordinator phases (8-10) will extend this to
+  wave-based durable-chunk discovery.
 - [ ] Phase 8 — Parallel workers: coordinator + multiple workers.
 - [ ] Phase 9 — Chunk leasing with heartbeats and safe reassignment.
 - [ ] Phase 10 — Coordinator: job creation, scheduling, progress, pause/resume/cancel.

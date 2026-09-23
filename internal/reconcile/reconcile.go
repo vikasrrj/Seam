@@ -27,6 +27,7 @@ type Reconciler struct {
 	marker          markerStore
 	scanner         scanner
 	sink            sink
+	sizer           chunkSizer
 	failpoints      *failpoint.Registry
 	metrics         *telemetry.Metrics
 	codec           capture.JSONCodec
@@ -92,6 +93,7 @@ type Config struct {
 	MarkerStore     markerStore
 	Scanner         scanner
 	Sink            sink
+	Adaptive        chunkSizer
 	Failpoints      *failpoint.Registry
 	Metrics         *telemetry.Metrics
 	// DisableEviction is a deliberately broken mode used by Phase 2 tests to
@@ -105,6 +107,13 @@ type chunkStore interface {
 	UpdateChunk(ctx context.Context, tx pgx.Tx, chunk *model.Chunk) error
 }
 
+// chunkSizer recommends the next chunk size from measured latencies. It is
+// optional; when nil, the configured fixed chunk size is used.
+type chunkSizer interface {
+	Suggest() int
+	Observe(duration time.Duration, rows int)
+}
+
 // New builds a reconciler. It does not start consuming.
 func New(cfg Config) *Reconciler {
 	r := &Reconciler{
@@ -116,6 +125,7 @@ func New(cfg Config) *Reconciler {
 		marker:          cfg.MarkerStore,
 		scanner:         cfg.Scanner,
 		sink:            cfg.Sink,
+		sizer:           cfg.Adaptive,
 		failpoints:      cfg.Failpoints,
 		metrics:         cfg.Metrics,
 		disableEviction: cfg.DisableEviction,
@@ -142,13 +152,18 @@ func (r *Reconciler) Run(ctx context.Context) error {
 }
 
 // runLegacyLoop uses the scanner to discover chunks on the fly. It is used
-// when no chunk store is configured.
+// when no chunk store is configured. When an adaptive sizer is configured, the
+// chunk size is re-suggested per iteration from measured latency.
 func (r *Reconciler) runLegacyLoop(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		chunkRange, ok, err := r.scanner.NextChunk(ctx, r.cp.CompletedThrough, r.cp.ScanUpperBound, r.cfg.ChunkSize)
+		size := r.cfg.ChunkSize
+		if r.sizer != nil {
+			size = r.sizer.Suggest()
+		}
+		chunkRange, ok, err := r.scanner.NextChunk(ctx, r.cp.CompletedThrough, r.cp.ScanUpperBound, size)
 		if err != nil {
 			return fmt.Errorf("next chunk: %w", err)
 		}
@@ -220,6 +235,7 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 	r.mu.Unlock()
 
 	log.Printf("seam: chunk %s starting", chunkRange)
+	chunkStart := time.Now()
 
 	if r.chunkStore != nil {
 		chunk.Status = model.ChunkScanning
@@ -295,6 +311,9 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 			return err
 		}
 		if done {
+			if r.sizer != nil {
+				r.sizer.Observe(time.Since(chunkStart), len(rows))
+			}
 			return nil
 		}
 	}
