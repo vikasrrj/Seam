@@ -1,7 +1,10 @@
 // Package model contains the small, explicit data types shared across Seam.
 package model
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 type Operation string
 
@@ -70,15 +73,17 @@ func (c Change) Key() string {
 
 // JobConfig identifies one backfill job.
 type JobConfig struct {
-	JobID           string
-	SourceDSN       string
-	SourceReplDSN   string
-	SourceSlot      string
+	JobID             string
+	SourceDSN         string
+	SourceReplDSN     string
+	SourceSlot        string
 	SourcePublication string
-	DestDSN         string
-	KafkaBrokers    []string
-	KafkaTopic      string
-	ChunkSize       int
+	DestDSN           string
+	KafkaBrokers      []string
+	KafkaTopic        string
+	ChunkSize         int
+	WorkerID          string
+	LeaseDuration     time.Duration
 }
 
 // Checkpoint is the durable progress state for a job.
@@ -91,6 +96,46 @@ type Checkpoint struct {
 	NextKafkaOffset  int64
 	LastAppliedLSN   string
 	Active           bool
+}
+
+// ChunkState is the lifecycle state of a backfill chunk.
+type ChunkState string
+
+const (
+	ChunkPending     ChunkState = "pending"
+	ChunkLeased      ChunkState = "leased"
+	ChunkScanning    ChunkState = "scanning"
+	ChunkReconciling ChunkState = "reconciling"
+	ChunkCommitting  ChunkState = "committing"
+	ChunkCompleted   ChunkState = "completed"
+	ChunkFailed      ChunkState = "failed"
+)
+
+// Chunk is the durable state of one primary-key range within a job.
+type Chunk struct {
+	JobID        string
+	ChunkMinID   int64
+	ChunkMaxID   int64
+	Attempt      string
+	Status       ChunkState
+	WorkerID     string
+	LeaseStart   *time.Time
+	LeaseExpiry  *time.Time
+	HeartbeatAt  *time.Time
+	LowOffset    *int64
+	HighOffset   *int64
+	LowLSN       *string
+	HighLSN      *string
+	RowsScanned  int64
+	RowsApplied  int64
+	ErrorMessage string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// Range returns the inclusive primary-key interval for the chunk.
+func (c *Chunk) Range() ChunkRange {
+	return ChunkRange{Min: c.ChunkMinID, Max: c.ChunkMaxID}
 }
 
 // ChunkRange is an inclusive primary-key interval.

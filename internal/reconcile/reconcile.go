@@ -7,15 +7,12 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"example.com/seam/internal/capture"
-	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/failpoint"
 	"example.com/seam/internal/kafka"
-	"example.com/seam/internal/marker"
 	"example.com/seam/internal/model"
-	"example.com/seam/internal/scan"
-	"example.com/seam/internal/sink"
 	"example.com/seam/internal/telemetry"
 	"github.com/jackc/pgx/v5"
 )
@@ -24,11 +21,12 @@ import (
 type Reconciler struct {
 	cfg        model.JobConfig
 	cp         *model.Checkpoint
-	consumer   *kafka.Consumer
-	cpStore    *checkpoint.Store
-	marker     *marker.Store
-	scanner    *scan.ChunkReader
-	sink       *sink.Mutator
+	consumer   consumer
+	cpStore    checkpointStore
+	chunkStore chunkStore
+	marker     markerStore
+	scanner    scanner
+	sink       sink
 	failpoints *failpoint.Registry
 	metrics    *telemetry.Metrics
 	codec           capture.JSONCodec
@@ -39,6 +37,37 @@ type Reconciler struct {
 	chunk       model.ChunkRange
 	candidates  map[int64]model.Account
 	windowState WindowState
+}
+
+// consumer reads decoded Kafka records.
+type consumer interface {
+	Poll(ctx context.Context) ([]kafka.Record, error)
+	Close()
+}
+
+// checkpointStore persists job progress and applied-transaction bookkeeping.
+type checkpointStore interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+	UpdateCheckpoint(ctx context.Context, tx pgx.Tx, cp *model.Checkpoint) error
+	MarkApplied(ctx context.Context, tx pgx.Tx, jobID, generation, lsn string, xid uint32) error
+}
+
+// markerStore writes LOW/HIGH control markers on the source.
+type markerStore interface {
+	WriteLow(ctx context.Context, jobID, attempt string, chunk model.ChunkRange) (string, error)
+	WriteHigh(ctx context.Context, jobID, attempt string, chunk model.ChunkRange) (string, error)
+}
+
+// scanner reads bounded primary-key chunks from the source table.
+type scanner interface {
+	NextChunk(ctx context.Context, completedThrough, upperBound int64, chunkSize int) (model.ChunkRange, bool, error)
+	ReadChunk(ctx context.Context, minID, maxID int64) ([]model.Account, error)
+}
+
+// sink applies row changes and surviving snapshot candidates to the destination.
+type sink interface {
+	Apply(ctx context.Context, tx pgx.Tx, change model.Change) error
+	WriteCandidates(ctx context.Context, tx pgx.Tx, candidates []model.Account) error
 }
 
 // WindowState tracks where the reconciler is relative to the current markers.
@@ -57,16 +86,23 @@ const (
 type Config struct {
 	JobConfig       model.JobConfig
 	Checkpoint      *model.Checkpoint
-	Consumer        *kafka.Consumer
-	CheckpointStore *checkpoint.Store
-	MarkerStore     *marker.Store
-	Scanner         *scan.ChunkReader
-	Sink            *sink.Mutator
+	Consumer        consumer
+	CheckpointStore checkpointStore
+	ChunkStore      chunkStore
+	MarkerStore     markerStore
+	Scanner         scanner
+	Sink            sink
 	Failpoints      *failpoint.Registry
 	Metrics         *telemetry.Metrics
 	// DisableEviction is a deliberately broken mode used by Phase 2 tests to
 	// demonstrate stale overwrite and delete resurrection.
 	DisableEviction bool
+}
+
+// chunkStore persists per-chunk lifecycle state and leases.
+type chunkStore interface {
+	LeaseChunk(ctx context.Context, jobID, workerID string, leaseDuration time.Duration) (*model.Chunk, error)
+	UpdateChunk(ctx context.Context, tx pgx.Tx, chunk *model.Chunk) error
 }
 
 // New builds a reconciler. It does not start consuming.
@@ -76,6 +112,7 @@ func New(cfg Config) *Reconciler {
 		cp:              cfg.Checkpoint,
 		consumer:        cfg.Consumer,
 		cpStore:         cfg.CheckpointStore,
+		chunkStore:      cfg.ChunkStore,
 		marker:          cfg.MarkerStore,
 		scanner:         cfg.Scanner,
 		sink:            cfg.Sink,
@@ -98,11 +135,20 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	log.Printf("seam: starting job=%s generation=%s attempt=%s completed_through=%d upper_bound=%d next_offset=%d",
 		r.cp.JobID, r.cp.Generation, r.cp.Attempt, r.cp.CompletedThrough, r.cp.ScanUpperBound, r.cp.NextKafkaOffset)
 
+	if r.chunkStore != nil {
+		return r.runChunkStoreLoop(ctx)
+	}
+	return r.runLegacyLoop(ctx)
+}
+
+// runLegacyLoop uses the scanner to discover chunks on the fly. It is used
+// when no chunk store is configured.
+func (r *Reconciler) runLegacyLoop(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		chunk, ok, err := r.scanner.NextChunk(ctx, r.cp.CompletedThrough, r.cp.ScanUpperBound, r.cfg.ChunkSize)
+		chunkRange, ok, err := r.scanner.NextChunk(ctx, r.cp.CompletedThrough, r.cp.ScanUpperBound, r.cfg.ChunkSize)
 		if err != nil {
 			return fmt.Errorf("next chunk: %w", err)
 		}
@@ -110,6 +156,35 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			log.Printf("seam: backfill complete, continuing cdc-only mode")
 			return r.runCDCOnly(ctx)
 		}
+		chunk := &model.Chunk{
+			JobID:      r.cfg.JobID,
+			ChunkMinID: chunkRange.Min,
+			ChunkMaxID: chunkRange.Max,
+			Attempt:    r.cp.Attempt,
+			Status:     model.ChunkScanning,
+		}
+		if err := r.runChunk(ctx, chunk); err != nil {
+			return err
+		}
+	}
+}
+
+// runChunkStoreLoop leases chunks from durable state. This is the worker mode.
+func (r *Reconciler) runChunkStoreLoop(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk, err := r.chunkStore.LeaseChunk(ctx, r.cfg.JobID, r.cfg.WorkerID, r.cfg.LeaseDuration)
+		if err != nil {
+			return fmt.Errorf("lease chunk: %w", err)
+		}
+		if chunk == nil {
+			log.Printf("seam: backfill complete, continuing cdc-only mode")
+			return r.runCDCOnly(ctx)
+		}
+		chunk.Attempt = r.cp.Attempt
+		chunk.Status = model.ChunkScanning
 		if err := r.runChunk(ctx, chunk); err != nil {
 			return err
 		}
@@ -137,16 +212,24 @@ func (r *Reconciler) runCDCOnly(ctx context.Context) error {
 }
 
 // runChunk executes one reconciliation window.
-func (r *Reconciler) runChunk(ctx context.Context, chunk model.ChunkRange) error {
+func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
+	chunkRange := chunk.Range()
 	r.mu.Lock()
-	r.chunk = chunk
+	r.chunk = chunkRange
 	r.windowState = OutsideWindow
 	r.mu.Unlock()
 
-	log.Printf("seam: chunk %s starting", chunk)
+	log.Printf("seam: chunk %s starting", chunkRange)
+
+	if r.chunkStore != nil {
+		chunk.Status = model.ChunkScanning
+		if err := r.updateChunkState(ctx, chunk); err != nil {
+			return fmt.Errorf("update chunk scanning: %w", err)
+		}
+	}
 
 	// 1. Write LOW marker.
-	lowID, err := r.marker.WriteLow(ctx, r.cfg.JobID, r.cp.Attempt, chunk)
+	lowID, err := r.marker.WriteLow(ctx, r.cfg.JobID, r.cp.Attempt, chunkRange)
 	if err != nil {
 		return fmt.Errorf("write low marker: %w", err)
 	}
@@ -155,9 +238,9 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk model.ChunkRange) error
 	}
 
 	// 2. Read historical chunk into candidate map.
-	rows, err := r.scanner.ReadChunk(ctx, chunk.Min, chunk.Max)
+	rows, err := r.scanner.ReadChunk(ctx, chunkRange.Min, chunkRange.Max)
 	if err != nil {
-		return fmt.Errorf("read chunk %s: %w", chunk, err)
+		return fmt.Errorf("read chunk %s: %w", chunkRange, err)
 	}
 	r.mu.Lock()
 	r.candidates = make(map[int64]model.Account, len(rows))
@@ -165,18 +248,32 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk model.ChunkRange) error
 		r.candidates[account.ID] = account
 	}
 	r.mu.Unlock()
-	log.Printf("seam: chunk %s read %d candidates", chunk, len(rows))
+	log.Printf("seam: chunk %s read %d candidates", chunkRange, len(rows))
+
+	if r.chunkStore != nil {
+		chunk.RowsScanned = int64(len(rows))
+		if err := r.updateChunkState(ctx, chunk); err != nil {
+			return fmt.Errorf("update chunk rows_scanned: %w", err)
+		}
+	}
 
 	if err := r.maybeWait(ctx, failpoint.AfterChunkReadBeforeReconciliation); err != nil {
 		return err
 	}
 
 	// 3. Write HIGH marker.
-	highID, err := r.marker.WriteHigh(ctx, r.cfg.JobID, r.cp.Attempt, chunk)
+	highID, err := r.marker.WriteHigh(ctx, r.cfg.JobID, r.cp.Attempt, chunkRange)
 	if err != nil {
 		return fmt.Errorf("write high marker: %w", err)
 	}
 	log.Printf("seam: markers low=%s high=%s", lowID, highID)
+
+	if r.chunkStore != nil {
+		chunk.Status = model.ChunkReconciling
+		if err := r.updateChunkState(ctx, chunk); err != nil {
+			return fmt.Errorf("update chunk reconciling: %w", err)
+		}
+	}
 
 	// 4. Consume Kafka until HIGH is processed.
 	for {
@@ -190,7 +287,7 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk model.ChunkRange) error
 		if len(records) == 0 {
 			continue
 		}
-		done, err := r.processChunkRecords(ctx, records)
+		done, err := r.processChunkRecords(ctx, records, chunk)
 		if err != nil {
 			return err
 		}
@@ -200,9 +297,25 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk model.ChunkRange) error
 	}
 }
 
+// updateChunkState persists the current chunk state when a chunk store is configured.
+func (r *Reconciler) updateChunkState(ctx context.Context, chunk *model.Chunk) error {
+	if r.chunkStore == nil {
+		return nil
+	}
+	tx, err := r.cpStore.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := r.chunkStore.UpdateChunk(ctx, tx, chunk); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // processChunkRecords applies a batch of Kafka records while inside a chunk.
 // It returns true when the chunk is complete.
-func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Record) (bool, error) {
+func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Record, chunk *model.Chunk) (bool, error) {
 	r.mu.Lock()
 	state := r.windowState
 	r.mu.Unlock()
@@ -225,7 +338,7 @@ func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Re
 		// If the group contains the HIGH marker for the current attempt, the
 		// chunk completion transaction includes surviving candidates.
 		if state == CompletingWindow {
-			if err := r.completeChunk(ctx, group); err != nil {
+			if err := r.completeChunk(ctx, group, chunk); err != nil {
 				return false, err
 			}
 			// Drain any remaining groups in this batch in CDC-only mode. They
@@ -312,13 +425,7 @@ func (r *Reconciler) applySourceTransaction(ctx context.Context, group []kafka.R
 	}
 	source := group[0].Change.Source
 
-	conn, err := r.cpStore.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close(context.Background())
-
-	tx, err := conn.Begin(ctx)
+	tx, err := r.cpStore.Begin(ctx)
 	if err != nil {
 		return err
 	}
@@ -376,23 +483,35 @@ func (r *Reconciler) applyChange(ctx context.Context, tx pgx.Tx, change model.Ch
 }
 
 // completeChunk commits the chunk completion transaction: surviving candidates,
-// checkpoint cursor, and Kafka progress through HIGH.
-func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record) error {
+// checkpoint cursor, chunk state, and Kafka progress through HIGH.
+//
+// Durability protocol: all writes inside this function execute inside a single
+// destination transaction. The chunk status is moved to Committing, then the
+// survivors and checkpoint are written, then the status is moved to Completed.
+// Only when the transaction commits do any of these changes become durable.
+// If the process crashes before commit, the transaction rolls back and the
+// chunk remains in its previous state; recovery will retry it under a new
+// attempt without ever exposing a partially-completed chunk.
+func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record, chunk *model.Chunk) error {
 	if err := r.maybeWait(ctx, failpoint.AfterHighMarkerObserved); err != nil {
 		return err
 	}
 
-	conn, err := r.cpStore.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close(context.Background())
-
-	tx, err := conn.Begin(ctx)
+	tx, err := r.cpStore.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+
+	if r.chunkStore != nil {
+		chunk.Status = model.ChunkCommitting
+		chunk.HighLSN = &highGroup[0].Change.Source.LSN
+		off := highGroup[len(highGroup)-1].Offset
+		chunk.HighOffset = &off
+		if err := r.chunkStore.UpdateChunk(ctx, tx, chunk); err != nil {
+			return fmt.Errorf("update chunk committing: %w", err)
+		}
+	}
 
 	// Apply any account changes that happened to be in the same source
 	// transaction as the HIGH marker (they are idempotent, so unconditional
@@ -432,6 +551,10 @@ func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record
 	r.candidates = nil
 	r.mu.Unlock()
 
+	if r.chunkStore != nil {
+		chunk.RowsApplied = int64(cdcCount)
+	}
+
 	if err := r.sink.WriteCandidates(ctx, tx, survivors); err != nil {
 		return fmt.Errorf("write survivors: %w", err)
 	}
@@ -440,6 +563,13 @@ func (r *Reconciler) completeChunk(ctx context.Context, highGroup []kafka.Record
 	lastOffset := highGroup[len(highGroup)-1].Offset
 	if err := r.updateCheckpoint(ctx, tx, lastOffset, source.LSN); err != nil {
 		return err
+	}
+
+	if r.chunkStore != nil {
+		chunk.Status = model.ChunkCompleted
+		if err := r.chunkStore.UpdateChunk(ctx, tx, chunk); err != nil {
+			return fmt.Errorf("update chunk completed: %w", err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {

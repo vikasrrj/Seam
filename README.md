@@ -28,8 +28,13 @@ The project started as a way to answer one question: can a single-table
 backfill with live replication be made exactly-once and still stay simple
 enough to reason about? The answer lives in a few small packages
 (`internal/checkpoint`, `internal/marker`, `internal/recovery`,
-`internal/scan`) and a crash test that restarts the whole pipeline mid-write
-until the source and destination match exactly.
+`internal/scan`, `internal/reconcile`) and a crash test that restarts the
+whole pipeline mid-write until the source and destination match exactly.
+
+This repository is now being upgraded from that local prototype into a
+production-grade, crash-safe, distributed backfill system. The work is tracked
+in numbered phases; Phases 1 and 2 are implemented and tested, with the rest
+laid out in the roadmap below.
 
 ## Architecture
 
@@ -48,7 +53,7 @@ Data path:
       -> capture reader
       -> JSON records on one Kafka topic, one partition
       -> reconciler
-      -> destination accounts, seam_jobs, seam_checkpoints, seam_applied_txs
+      -> destination accounts, seam_jobs, seam_checkpoints, seam_applied_txs, seam_chunks
 
 The reconciler works one chunk at a time. For a chunk
 `completed_through_id < id <= scan_upper_bound`:
@@ -61,7 +66,11 @@ The reconciler works one chunk at a time. For a chunk
 5. Commits survivors, the checkpoint cursor, and the Kafka offset in one
    destination transaction.
 
-Once the cursor passes the upper bound, the reconciler stays in CDC-only mode.
+When configured with a chunk store (`cmd/seam` uses `checkpoint.Store`), the
+reconciler leases chunks from durable `seam_chunks` state and transitions each
+chunk through `pending -> leased -> scanning -> reconciling -> committing ->
+completed`. A worker that crashes releases its lease on expiry, and recovery
+reschedules unfinished chunks under a new attempt.
 
 Failpoints (`internal/failpoint`) pause the reconciler at fixed points for the
 crash tests. HTTP endpoints (`/healthz`, `/metrics`, `/progress`) turn on when
@@ -111,6 +120,8 @@ These follow from the design, so read them before running this in production.
 | `SEAM_SOURCE_SLOT` | Replication slot | `seam_slot` |
 | `SEAM_SOURCE_PUBLICATION` | Publication | `seam_pub` |
 | `SEAM_CHUNK_SIZE` | Rows per chunk | `1000` |
+| `SEAM_WORKER_ID` | Worker identity for chunk leases | `<hostname>-<nanoseconds>` |
+| `SEAM_LEASE_DURATION` | Chunk lease TTL | `30s` |
 | `SEAM_GENERATION` | Generation tag written into changes and checkpoints | `gen:0` |
 | `SEAM_HTTP_ADDR` | Enables HTTP endpoints | unset |
 
@@ -137,9 +148,10 @@ Restart `cmd/seam` without `-start-fresh`. On restart it:
 1. loads `seam_jobs` and `seam_checkpoints`,
 2. validates the source DSN and the destination schema fingerprint,
 3. fails hard if the replication slot is gone,
-4. bumps the attempt if a chunk was unfinished,
-5. fails hard if the checkpoint offset is no longer retained by the topic,
-6. resumes from `next_kafka_offset`.
+4. releases expired chunk leases,
+5. loads incomplete chunks and reschedules them under a new attempt,
+6. fails hard if the checkpoint offset is no longer retained by the topic,
+7. resumes from `next_kafka_offset`.
 
 ## Verify
 
@@ -169,3 +181,51 @@ With `SEAM_HTTP_ADDR` set:
 - `GET /healthz` returns `ok`
 - `GET /metrics` returns Prometheus-style counters
 - `GET /progress` returns the checkpoint and counters as JSON
+
+## Roadmap
+
+The upgrade is being worked through in phases. Completed phases are marked.
+
+- [x] Phase 1 — Backfill correctness: LOW/HIGH markers, eviction of touched
+  candidates, insert/update/delete safety, multiple changes to the same key,
+  idempotent retries, duplicate CDC tolerance.
+- [x] Phase 2 — Durable job state: `seam_chunks` table, explicit chunk states
+  (`pending/leased/scanning/reconciling/committing/completed/failed`), chunk
+  leasing, heartbeat fields, and recovery that reschedules unfinished chunks.
+- [x] Phase 3 — Crash recovery: resume from last durable checkpoint at every
+  crash boundary (before/during/after LOW, snapshot, HIGH, reconciliation,
+  commit).
+- [x] Phase 4 — Atomic chunk completion: destination write, checkpoint, and
+  chunk completion are committed in the same destination transaction. The
+  chunk transitions to `committing`, then `completed`, and only the commit
+  makes any of it durable. Verified with crash tests at the pre-commit and
+  post-commit boundaries.
+- [ ] Phase 5 — Bounded memory: chunked scanning, bounded CDC buffers, batch
+  limits.
+- [ ] Phase 6 — Scalable PostgreSQL scanning: keyset pagination only,
+  configurable chunk size, multi-key-type support.
+- [ ] Phase 7 — Adaptive chunking: measure duration/latency and resize chunks.
+- [ ] Phase 8 — Parallel workers: coordinator + multiple workers.
+- [ ] Phase 9 — Chunk leasing with heartbeats and safe reassignment.
+- [ ] Phase 10 — Coordinator: job creation, scheduling, progress, pause/resume/cancel.
+- [ ] Phase 11 — Multi-table backfills.
+- [ ] Phase 12 — Destination batching.
+- [ ] Phase 13 — Backpressure.
+- [ ] Phase 14 — Source protection / rate limiting.
+- [ ] Phase 15 — Retry system.
+- [ ] Phase 16 — Connection recovery.
+- [ ] Phase 17 — Schema change detection.
+- [ ] Phase 18 — Graceful shutdown.
+- [ ] Phase 19 — Configuration.
+- [ ] Phase 20 — Remote/cloud PostgreSQL.
+- [ ] Phase 21 — Observability / Prometheus metrics.
+- [ ] Phase 22 — Structured logging.
+- [ ] Phase 23 — Health endpoints.
+- [ ] Phase 24 — Docker images.
+- [ ] Phase 25 — Kubernetes readiness.
+- [ ] Phase 26 — Correctness verification tool.
+- [ ] Phase 27 — Workload generator.
+- [ ] Phase 28 — Failure injection harness.
+- [ ] Phase 29 — 10M / 100M benchmark.
+- [ ] Phase 30 — 1B row benchmark.
+- [ ] Phase 31 — Multi-billion / 10B validation.

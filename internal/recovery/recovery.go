@@ -4,6 +4,7 @@ package recovery
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/model"
@@ -58,14 +59,41 @@ func Recover(ctx context.Context, cpStore *checkpoint.Store, jobID string, expec
 		return nil, err
 	}
 
+	// Recover durable chunk state. Expired leases are released so another
+	// worker can pick the chunk up safely.
+	if _, err := cpStore.ReleaseExpiredLeases(ctx, jobID, time.Now()); err != nil {
+		return nil, fmt.Errorf("release expired leases: %w", err)
+	}
+
+	incomplete, err := cpStore.LoadIncompleteChunks(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("load incomplete chunks: %w", err)
+	}
+
 	// If a chunk was unfinished, start a fresh attempt with a new marker window.
-	if cp.CompletedThrough < cp.ScanUpperBound {
+	if cp.CompletedThrough < cp.ScanUpperBound || len(incomplete) > 0 {
 		newAttempt, err := BumpAttempt(cp.Attempt)
 		if err != nil {
 			return nil, err
 		}
 		cp.Attempt = newAttempt
 		logPrintf("recovery: unfinished chunk detected, new attempt=%s", cp.Attempt)
+
+		// Re-schedule any incomplete chunk under the new attempt. Completed
+		// chunks are left alone; workers will not re-scan them.
+		for _, ch := range incomplete {
+			newChunk := ch
+			newChunk.Attempt = newAttempt
+			newChunk.Status = model.ChunkPending
+			newChunk.WorkerID = ""
+			newChunk.LeaseStart = nil
+			newChunk.LeaseExpiry = nil
+			newChunk.HeartbeatAt = nil
+			newChunk.ErrorMessage = ""
+			if err := cpStore.CreateChunk(ctx, &newChunk); err != nil {
+				return nil, fmt.Errorf("reschedule chunk %s: %w", ch.Range(), err)
+			}
+		}
 	}
 
 	return &Result{Checkpoint: cp, Record: rec}, nil

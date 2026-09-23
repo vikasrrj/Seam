@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"example.com/seam/internal/capture"
 	"example.com/seam/internal/checkpoint"
@@ -25,16 +26,18 @@ import (
 )
 
 type config struct {
-	JobID           string
-	SourceDSN       string
-	SourceReplDSN   string
-	SourceSlot      string
+	JobID             string
+	SourceDSN         string
+	SourceReplDSN     string
+	SourceSlot        string
 	SourcePublication string
-	DestDSN         string
-	KafkaBrokers    []string
-	KafkaTopic      string
-	ChunkSize       int
-	StartFresh      bool
+	DestDSN           string
+	KafkaBrokers      []string
+	KafkaTopic        string
+	ChunkSize         int
+	WorkerID          string
+	LeaseDuration     time.Duration
+	StartFresh        bool
 }
 
 func main() {
@@ -72,6 +75,8 @@ func run(ctx context.Context, cfg config) error {
 			KafkaBrokers:      cfg.KafkaBrokers,
 			KafkaTopic:        cfg.KafkaTopic,
 			ChunkSize:         cfg.ChunkSize,
+			WorkerID:          cfg.WorkerID,
+			LeaseDuration:     cfg.LeaseDuration,
 		}
 		upperBound, err := scan.NewChunkReader(cfg.SourceDSN).UpperBound(ctx)
 		if err != nil {
@@ -80,6 +85,9 @@ func run(ctx context.Context, cfg config) error {
 		cp, err = cpStore.CreateJob(ctx, jobCfg, upperBound)
 		if err != nil {
 			return fmt.Errorf("create job: %w", err)
+		}
+		if err := cpStore.DiscoverAndCreateChunks(ctx, cfg.JobID, cp.Attempt, cfg.SourceDSN, upperBound, cfg.ChunkSize); err != nil {
+			return fmt.Errorf("discover chunks: %w", err)
 		}
 	} else {
 		result, err := recovery.Recover(ctx, cpStore, cfg.JobID, cfg.SourceDSN)
@@ -116,7 +124,7 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	reconciler := reconcile.New(reconcile.Config{
-		JobConfig:       model.JobConfig{
+		JobConfig: model.JobConfig{
 			JobID:             cfg.JobID,
 			SourceDSN:         cfg.SourceDSN,
 			SourceReplDSN:     cfg.SourceReplDSN,
@@ -126,10 +134,13 @@ func run(ctx context.Context, cfg config) error {
 			KafkaBrokers:      cfg.KafkaBrokers,
 			KafkaTopic:        cfg.KafkaTopic,
 			ChunkSize:         cfg.ChunkSize,
+			WorkerID:          cfg.WorkerID,
+			LeaseDuration:     cfg.LeaseDuration,
 		},
 		Checkpoint:      cp,
 		Consumer:        consumer,
 		CheckpointStore: cpStore,
+		ChunkStore:      cpStore,
 		MarkerStore:     markerStore,
 		Scanner:         scan.NewChunkReader(cfg.SourceDSN),
 		Sink:            sink.NewMutator(),
@@ -156,10 +167,20 @@ func loadConfig() config {
 		KafkaBrokers:      splitAndTrim(envOrDefault("KAFKA_BROKERS", "localhost:9092")),
 		KafkaTopic:        envOrDefault("KAFKA_TOPIC", "seam.accounts"),
 		ChunkSize:         intEnvOrDefault("SEAM_CHUNK_SIZE", 1000),
+		WorkerID:          envOrDefault("SEAM_WORKER_ID", defaultWorkerID()),
+		LeaseDuration:     durationEnvOrDefault("SEAM_LEASE_DURATION", 30*time.Second),
 	}
 	flag.BoolVar(&cfg.StartFresh, "start-fresh", false, "Create a new job instead of recovering")
 	flag.Parse()
 	return cfg
+}
+
+func defaultWorkerID() string {
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s-%d", host, time.Now().UnixNano())
 }
 
 func envOrDefault(name, fallback string) string {
@@ -179,6 +200,18 @@ func intEnvOrDefault(name string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func durationEnvOrDefault(name string, fallback time.Duration) time.Duration {
+	v := envOrDefault(name, "")
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
 }
 
 func splitAndTrim(value string) []string {
