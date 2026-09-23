@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -25,6 +26,12 @@ func main() {
 		KafkaBrokers:   splitAndTrim(envOrDefault("KAFKA_BROKERS", "localhost:9092")),
 		KafkaTopic:     envOrDefault("KAFKA_TOPIC", "seam.accounts"),
 		Generation:     envOrDefault("SEAM_GENERATION", "gen:0"),
+	}
+	if v := strings.TrimSpace(os.Getenv("SEAM_MAX_TX_EVENTS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil && n > 0 {
+			cfg.MaxTransactionEvents = n
+		}
 	}
 
 	reader, err := capture.StartReader(ctx, cfg)

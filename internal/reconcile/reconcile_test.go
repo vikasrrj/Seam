@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,7 +25,7 @@ type fakeConn struct {
 }
 
 func (c *fakeConn) Begin(ctx context.Context) (pgx.Tx, error) { return c.tx, nil }
-func (c *fakeConn) Close(ctx context.Context) error                { return nil }
+func (c *fakeConn) Close(ctx context.Context) error           { return nil }
 
 // fakeTx records commit/rollback and satisfies pgx.Tx.
 type fakeTx struct {
@@ -32,7 +33,9 @@ type fakeTx struct {
 	rolledBack bool
 }
 
-func (t *fakeTx) Begin(ctx context.Context) (pgx.Tx, error) { return nil, fmt.Errorf("not implemented") }
+func (t *fakeTx) Begin(ctx context.Context) (pgx.Tx, error) {
+	return nil, fmt.Errorf("not implemented")
+}
 func (t *fakeTx) Commit(ctx context.Context) error {
 	t.committed = true
 	return nil
@@ -45,7 +48,7 @@ func (t *fakeTx) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnN
 	return 0, fmt.Errorf("not implemented")
 }
 func (t *fakeTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults { return nil }
-func (t *fakeTx) LargeObjects() pgx.LargeObjects                         { return pgx.LargeObjects{} }
+func (t *fakeTx) LargeObjects() pgx.LargeObjects                               { return pgx.LargeObjects{} }
 func (t *fakeTx) Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error) {
 	return nil, fmt.Errorf("not implemented")
 }
@@ -56,7 +59,7 @@ func (t *fakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, 
 	return nil, fmt.Errorf("not implemented")
 }
 func (t *fakeTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row { return nil }
-func (t *fakeTx) Conn() *pgx.Conn                                                { return nil }
+func (t *fakeTx) Conn() *pgx.Conn                                               { return nil }
 
 // fakeCheckpointStore records checkpoint and applied-transaction calls.
 type fakeCheckpointStore struct {
@@ -1094,5 +1097,64 @@ func TestReconciler_ChunkStoreMode(t *testing.T) {
 	}
 	if len(sink.survivorIDs()) != 3 {
 		t.Fatalf("expected 3 survivors, got %v", sink.survivorIDs())
+	}
+}
+
+// TestBoundedMemory_CandidateCap fails the job when a chunk read exceeds the
+// configured in-memory candidate limit instead of growing memory without bound.
+func TestBoundedMemory_CandidateCap(t *testing.T) {
+	rows := map[int64]model.Account{
+		1: account(1, "one", 100),
+		2: account(2, "two", 200),
+		3: account(3, "three", 300),
+	}
+	chunk := model.ChunkRange{Min: 1, Max: 3}
+	cfg, _, _, _ := setup(rows, 10, [][]kafka.Record{chunkBatch("test-job", "gen:0:attempt:0", chunk)})
+	cfg.JobConfig.MaxInMemoryCandidates = 2 // smaller than the chunk's 3 rows
+
+	err := runReconciler(t, cfg, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error when chunk exceeds max in-memory candidates")
+	}
+	if !strings.Contains(err.Error(), "max in-memory candidates") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestBoundedMemory_BatchCap fails the job when the consumer hands over a
+// batch larger than the configured record limit.
+func TestBoundedMemory_BatchCap(t *testing.T) {
+	rows := map[int64]model.Account{
+		1: account(1, "one", 100),
+		2: account(2, "two", 200),
+	}
+	chunk := model.ChunkRange{Min: 1, Max: 2}
+	cfg, _, _, _ := setup(rows, 10, [][]kafka.Record{chunkBatch("test-job", "gen:0:attempt:0", chunk)})
+	cfg.JobConfig.MaxRecordsPerBatch = 1 // the batch has 2 records (low, high)
+
+	err := runReconciler(t, cfg, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error when batch exceeds max records per batch")
+	}
+	if !strings.Contains(err.Error(), "max records per batch") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestBoundedMemory_DefaultsUnlimited verifies the zero-value config keeps the
+// legacy unlimited behavior so fakes and small tests stay simple.
+func TestBoundedMemory_DefaultsUnlimited(t *testing.T) {
+	rows := map[int64]model.Account{
+		1: account(1, "one", 100),
+		2: account(2, "two", 200),
+	}
+	chunk := model.ChunkRange{Min: 1, Max: 2}
+	cfg, sink, _, _ := setup(rows, 10, [][]kafka.Record{chunkBatch("test-job", "gen:0:attempt:0", chunk)})
+
+	if err := runReconciler(t, cfg, 5*time.Second); err != nil {
+		t.Fatalf("run reconciler: %v", err)
+	}
+	if len(sink.survivorIDs()) != 2 {
+		t.Fatalf("expected 2 survivors, got %v", sink.survivorIDs())
 	}
 }

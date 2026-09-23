@@ -84,6 +84,13 @@ type JobConfig struct {
 	ChunkSize         int
 	WorkerID          string
 	LeaseDuration     time.Duration
+	// MaxInMemoryCandidates bounds the candidate map held for one chunk. 0
+	// means unlimited (unit-test default). A chunk read that exceeds the cap
+	// fails the job instead of growing memory without bound.
+	MaxInMemoryCandidates int
+	// MaxRecordsPerBatch bounds how many Kafka records are processed at once.
+	// 0 means unlimited (unit-test default).
+	MaxRecordsPerBatch int
 }
 
 // Checkpoint is the durable progress state for a job.

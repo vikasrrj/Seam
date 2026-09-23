@@ -54,6 +54,7 @@ stale snapshot.
 
 ## Current status
 
-- Phase 1 (backfill correctness) and Phase 2 (durable chunk state) are
-  implemented and covered by unit tests.
+- Phase 1 (backfill correctness), Phase 2 (durable chunk state), Phase 3 (crash
+  recovery), Phase 4 (atomic chunk completion), and Phase 5 (bounded memory)
+  are implemented and covered by unit tests.
 - Remaining phases are listed in `README.md` under Roadmap.

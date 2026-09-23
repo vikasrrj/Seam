@@ -26,18 +26,20 @@ import (
 )
 
 type config struct {
-	JobID             string
-	SourceDSN         string
-	SourceReplDSN     string
-	SourceSlot        string
-	SourcePublication string
-	DestDSN           string
-	KafkaBrokers      []string
-	KafkaTopic        string
-	ChunkSize         int
-	WorkerID          string
-	LeaseDuration     time.Duration
-	StartFresh        bool
+	JobID                 string
+	SourceDSN             string
+	SourceReplDSN         string
+	SourceSlot            string
+	SourcePublication     string
+	DestDSN               string
+	KafkaBrokers          []string
+	KafkaTopic            string
+	ChunkSize             int
+	WorkerID              string
+	LeaseDuration         time.Duration
+	MaxInMemoryCandidates int
+	MaxRecordsPerBatch    int
+	StartFresh            bool
 }
 
 func main() {
@@ -66,17 +68,19 @@ func run(ctx context.Context, cfg config) error {
 			return err
 		}
 		jobCfg := model.JobConfig{
-			JobID:             cfg.JobID,
-			SourceDSN:         cfg.SourceDSN,
-			SourceReplDSN:     cfg.SourceReplDSN,
-			SourceSlot:        cfg.SourceSlot,
-			SourcePublication: cfg.SourcePublication,
-			DestDSN:           cfg.DestDSN,
-			KafkaBrokers:      cfg.KafkaBrokers,
-			KafkaTopic:        cfg.KafkaTopic,
-			ChunkSize:         cfg.ChunkSize,
-			WorkerID:          cfg.WorkerID,
-			LeaseDuration:     cfg.LeaseDuration,
+			JobID:                 cfg.JobID,
+			SourceDSN:             cfg.SourceDSN,
+			SourceReplDSN:         cfg.SourceReplDSN,
+			SourceSlot:            cfg.SourceSlot,
+			SourcePublication:     cfg.SourcePublication,
+			DestDSN:               cfg.DestDSN,
+			KafkaBrokers:          cfg.KafkaBrokers,
+			KafkaTopic:            cfg.KafkaTopic,
+			ChunkSize:             cfg.ChunkSize,
+			WorkerID:              cfg.WorkerID,
+			LeaseDuration:         cfg.LeaseDuration,
+			MaxInMemoryCandidates: cfg.MaxInMemoryCandidates,
+			MaxRecordsPerBatch:    cfg.MaxRecordsPerBatch,
 		}
 		upperBound, err := scan.NewChunkReader(cfg.SourceDSN).UpperBound(ctx)
 		if err != nil {
@@ -111,7 +115,8 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("ensure marker table: %w", err)
 	}
 
-	consumer, err := kafka.NewConsumer(cfg.KafkaBrokers, cfg.KafkaTopic, cp.NextKafkaOffset, decodeChange)
+	consumer, err := kafka.NewConsumer(cfg.KafkaBrokers, cfg.KafkaTopic, cp.NextKafkaOffset, decodeChange,
+		kafka.WithMaxPollRecords(cfg.MaxRecordsPerBatch))
 	if err != nil {
 		return fmt.Errorf("create consumer: %w", err)
 	}
@@ -125,17 +130,19 @@ func run(ctx context.Context, cfg config) error {
 
 	reconciler := reconcile.New(reconcile.Config{
 		JobConfig: model.JobConfig{
-			JobID:             cfg.JobID,
-			SourceDSN:         cfg.SourceDSN,
-			SourceReplDSN:     cfg.SourceReplDSN,
-			SourceSlot:        cfg.SourceSlot,
-			SourcePublication: cfg.SourcePublication,
-			DestDSN:           cfg.DestDSN,
-			KafkaBrokers:      cfg.KafkaBrokers,
-			KafkaTopic:        cfg.KafkaTopic,
-			ChunkSize:         cfg.ChunkSize,
-			WorkerID:          cfg.WorkerID,
-			LeaseDuration:     cfg.LeaseDuration,
+			JobID:                 cfg.JobID,
+			SourceDSN:             cfg.SourceDSN,
+			SourceReplDSN:         cfg.SourceReplDSN,
+			SourceSlot:            cfg.SourceSlot,
+			SourcePublication:     cfg.SourcePublication,
+			DestDSN:               cfg.DestDSN,
+			KafkaBrokers:          cfg.KafkaBrokers,
+			KafkaTopic:            cfg.KafkaTopic,
+			ChunkSize:             cfg.ChunkSize,
+			WorkerID:              cfg.WorkerID,
+			LeaseDuration:         cfg.LeaseDuration,
+			MaxInMemoryCandidates: cfg.MaxInMemoryCandidates,
+			MaxRecordsPerBatch:    cfg.MaxRecordsPerBatch,
 		},
 		Checkpoint:      cp,
 		Consumer:        consumer,
@@ -158,17 +165,19 @@ func decodeChange(data []byte) (model.Change, error) {
 
 func loadConfig() config {
 	cfg := config{
-		JobID:             envOrDefault("SEAM_JOB_ID", "seam-default"),
-		SourceDSN:         envOrDefault("SOURCE_SQL_DSN", "postgres://postgres:postgres@localhost:5433/source?sslmode=disable"),
-		SourceReplDSN:     envOrDefault("SOURCE_REPLICATION_DSN", "postgres://postgres:postgres@localhost:5433/source?sslmode=disable&replication=database"),
-		SourceSlot:        envOrDefault("SEAM_SOURCE_SLOT", "seam_slot"),
-		SourcePublication: envOrDefault("SEAM_SOURCE_PUBLICATION", "seam_pub"),
-		DestDSN:           envOrDefault("DEST_SQL_DSN", "postgres://postgres:postgres@localhost:5434/dest?sslmode=disable"),
-		KafkaBrokers:      splitAndTrim(envOrDefault("KAFKA_BROKERS", "localhost:9092")),
-		KafkaTopic:        envOrDefault("KAFKA_TOPIC", "seam.accounts"),
-		ChunkSize:         intEnvOrDefault("SEAM_CHUNK_SIZE", 1000),
-		WorkerID:          envOrDefault("SEAM_WORKER_ID", defaultWorkerID()),
-		LeaseDuration:     durationEnvOrDefault("SEAM_LEASE_DURATION", 30*time.Second),
+		JobID:                 envOrDefault("SEAM_JOB_ID", "seam-default"),
+		SourceDSN:             envOrDefault("SOURCE_SQL_DSN", "postgres://postgres:postgres@localhost:5433/source?sslmode=disable"),
+		SourceReplDSN:         envOrDefault("SOURCE_REPLICATION_DSN", "postgres://postgres:postgres@localhost:5433/source?sslmode=disable&replication=database"),
+		SourceSlot:            envOrDefault("SEAM_SOURCE_SLOT", "seam_slot"),
+		SourcePublication:     envOrDefault("SEAM_SOURCE_PUBLICATION", "seam_pub"),
+		DestDSN:               envOrDefault("DEST_SQL_DSN", "postgres://postgres:postgres@localhost:5434/dest?sslmode=disable"),
+		KafkaBrokers:          splitAndTrim(envOrDefault("KAFKA_BROKERS", "localhost:9092")),
+		KafkaTopic:            envOrDefault("KAFKA_TOPIC", "seam.accounts"),
+		ChunkSize:             intEnvOrDefault("SEAM_CHUNK_SIZE", 1000),
+		WorkerID:              envOrDefault("SEAM_WORKER_ID", defaultWorkerID()),
+		LeaseDuration:         durationEnvOrDefault("SEAM_LEASE_DURATION", 30*time.Second),
+		MaxInMemoryCandidates: intEnvOrDefault("SEAM_MAX_IN_MEMORY_CANDIDATES", 1_000_000),
+		MaxRecordsPerBatch:    intEnvOrDefault("SEAM_MAX_RECORDS_PER_BATCH", 100),
 	}
 	flag.BoolVar(&cfg.StartFresh, "start-fresh", false, "Create a new job instead of recovering")
 	flag.Parse()

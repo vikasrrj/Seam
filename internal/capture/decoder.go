@@ -5,6 +5,7 @@ package capture
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -12,6 +13,18 @@ import (
 	"example.com/seam/internal/model"
 	"github.com/jackc/pglogrepl"
 )
+
+// defaultMaxTransactionEvents is the default cap on how many row changes a
+// single source transaction may buffer in memory before Seam refuses to
+// continue. It bounds peak memory regardless of how large a transaction the
+// source commits.
+const defaultMaxTransactionEvents = 1_000_000
+
+// ErrTransactionTooLarge is returned when a single source transaction exceeds
+// the decoder's in-memory event cap. Seam fails deliberately instead of
+// buffering an unbounded transaction; the operator must shrink the write or
+// raise the cap via configuration.
+var ErrTransactionTooLarge = errors.New("transaction exceeds in-memory event cap")
 
 // CommittedTransaction describes a committed source transaction whose events
 // are ready to be pulled one at a time.
@@ -30,6 +43,10 @@ type Decoder struct {
 	relations   map[uint32]*pglogrepl.RelationMessage
 	transaction *pendingTransaction
 	pull        *pullState
+	// MaxTransactionEvents bounds the in-memory buffer of one open source
+	// transaction. A transaction exceeding the cap fails the pipeline rather
+	// than growing memory without bound (see ErrTransactionTooLarge).
+	MaxTransactionEvents int
 }
 
 type pendingTransaction struct {
@@ -48,8 +65,9 @@ type pullState struct {
 
 func NewDecoder(generation string) *Decoder {
 	return &Decoder{
-		generation: generation,
-		relations:  make(map[uint32]*pglogrepl.RelationMessage),
+		generation:           generation,
+		relations:            make(map[uint32]*pglogrepl.RelationMessage),
+		MaxTransactionEvents: defaultMaxTransactionEvents,
 	}
 }
 
@@ -145,6 +163,9 @@ func (d *Decoder) relation(id uint32) (*pglogrepl.RelationMessage, error) {
 func (d *Decoder) append(change model.Change) error {
 	if d.transaction == nil {
 		return fmt.Errorf("row change outside transaction")
+	}
+	if d.MaxTransactionEvents > 0 && len(d.transaction.mem) >= d.MaxTransactionEvents {
+		return fmt.Errorf("%w: limit %d", ErrTransactionTooLarge, d.MaxTransactionEvents)
 	}
 	d.transaction.mem = append(d.transaction.mem, change)
 	return nil

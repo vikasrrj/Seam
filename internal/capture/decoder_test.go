@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -63,6 +64,38 @@ func TestDecoderMarkerRoundTrip(t *testing.T) {
 	}
 	if change.Marker.Kind != model.MarkerLow || change.Marker.ChunkMin != 1 || change.Marker.ChunkMax != 10 {
 		t.Fatalf("unexpected marker: %+v", change.Marker)
+	}
+}
+
+func TestDecoderBoundedTransactionEvents(t *testing.T) {
+	d := NewDecoder("gen:0")
+	d.MaxTransactionEvents = 5
+	d.Handle(relationAccounts())
+	d.Handle(beginMessage(10))
+	for i := 0; i < 5; i++ {
+		if _, err := d.Handle(insertAccount(int64(i+1), "o", 1)); err != nil {
+			t.Fatalf("handle insert %d: %v", i, err)
+		}
+	}
+	// The sixth event must be rejected: the in-flight buffer is bounded.
+	_, err := d.Handle(insertAccount(99, "o", 1))
+	if !errors.Is(err, ErrTransactionTooLarge) {
+		t.Fatalf("expected ErrTransactionTooLarge, got %v", err)
+	}
+	// The decoder is not wedged: it still remembers the buffered transaction.
+	tx, err := d.Handle(commitMessage(10, "0/500", "0/501"))
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if tx == nil || tx.Count != 5 {
+		t.Fatalf("expected 5 buffered events, got %+v", tx)
+	}
+}
+
+func TestDecoderDefaultTransactionCap(t *testing.T) {
+	d := NewDecoder("gen:0")
+	if d.MaxTransactionEvents <= 0 {
+		t.Fatalf("expected a positive default transaction cap, got %d", d.MaxTransactionEvents)
 	}
 }
 

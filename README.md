@@ -122,6 +122,9 @@ These follow from the design, so read them before running this in production.
 | `SEAM_CHUNK_SIZE` | Rows per chunk | `1000` |
 | `SEAM_WORKER_ID` | Worker identity for chunk leases | `<hostname>-<nanoseconds>` |
 | `SEAM_LEASE_DURATION` | Chunk lease TTL | `30s` |
+| `SEAM_MAX_IN_MEMORY_CANDIDATES` | Per-chunk candidate map cap | `1000000` |
+| `SEAM_MAX_RECORDS_PER_BATCH` | Cap on records processed per poll batch | `100` |
+| `SEAM_MAX_TX_EVENTS` | Cap on in-flight events of one source transaction (capture) | `1000000` |
 | `SEAM_GENERATION` | Generation tag written into changes and checkpoints | `gen:0` |
 | `SEAM_HTTP_ADDR` | Enables HTTP endpoints | unset |
 
@@ -200,8 +203,10 @@ The upgrade is being worked through in phases. Completed phases are marked.
   chunk transitions to `committing`, then `completed`, and only the commit
   makes any of it durable. Verified with crash tests at the pre-commit and
   post-commit boundaries.
-- [ ] Phase 5 — Bounded memory: chunked scanning, bounded CDC buffers, batch
-  limits.
+- [x] Phase 5 — Bounded memory: chunked scanning, bounded CDC buffers, batch
+  limits. The capture decoder caps in-flight events of one source transaction,
+  the consumer caps records per poll, and the reconciler enforces per-chunk
+  candidate and per-batch record limits before processing.
 - [ ] Phase 6 — Scalable PostgreSQL scanning: keyset pagination only,
   configurable chunk size, multi-key-type support.
 - [ ] Phase 7 — Adaptive chunking: measure duration/latency and resize chunks.

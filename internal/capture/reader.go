@@ -33,6 +33,9 @@ type ReaderConfig struct {
 	KafkaBrokers   []string
 	KafkaTopic     string
 	Generation     string
+	// MaxTransactionEvents bounds the in-memory buffer of a single source
+	// transaction. 0 keeps the decoder default (1,000,000 events).
+	MaxTransactionEvents int
 }
 
 // Reader streams one PostgreSQL publication to one Kafka topic/partition.
@@ -85,6 +88,9 @@ func StartReader(ctx context.Context, cfg ReaderConfig) (*Reader, error) {
 		nextStatus: time.Now().Add(standbyStatusInterval),
 		runCtx:     runCtx,
 		runCancel:  runCancel,
+	}
+	if cfg.MaxTransactionEvents > 0 {
+		reader.decoder.MaxTransactionEvents = cfg.MaxTransactionEvents
 	}
 
 	startLSN, slotExists, err := findSlotLSN(ctx, cfg.SQLDSN, cfg.Slot)

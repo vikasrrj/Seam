@@ -19,16 +19,16 @@ import (
 
 // Reconciler owns destination application during a Seam backfill.
 type Reconciler struct {
-	cfg        model.JobConfig
-	cp         *model.Checkpoint
-	consumer   consumer
-	cpStore    checkpointStore
-	chunkStore chunkStore
-	marker     markerStore
-	scanner    scanner
-	sink       sink
-	failpoints *failpoint.Registry
-	metrics    *telemetry.Metrics
+	cfg             model.JobConfig
+	cp              *model.Checkpoint
+	consumer        consumer
+	cpStore         checkpointStore
+	chunkStore      chunkStore
+	marker          markerStore
+	scanner         scanner
+	sink            sink
+	failpoints      *failpoint.Registry
+	metrics         *telemetry.Metrics
 	codec           capture.JSONCodec
 	disableEviction bool
 
@@ -242,6 +242,9 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 	if err != nil {
 		return fmt.Errorf("read chunk %s: %w", chunkRange, err)
 	}
+	if n := len(rows); r.cfg.MaxInMemoryCandidates > 0 && n > r.cfg.MaxInMemoryCandidates {
+		return fmt.Errorf("chunk %s read %d rows exceeds max in-memory candidates %d", chunkRange, n, r.cfg.MaxInMemoryCandidates)
+	}
 	r.mu.Lock()
 	r.candidates = make(map[int64]model.Account, len(rows))
 	for _, account := range rows {
@@ -316,6 +319,9 @@ func (r *Reconciler) updateChunkState(ctx context.Context, chunk *model.Chunk) e
 // processChunkRecords applies a batch of Kafka records while inside a chunk.
 // It returns true when the chunk is complete.
 func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Record, chunk *model.Chunk) (bool, error) {
+	if err := r.checkBatchBounds(records); err != nil {
+		return false, err
+	}
 	r.mu.Lock()
 	state := r.windowState
 	r.mu.Unlock()
@@ -595,11 +601,25 @@ func (r *Reconciler) updateCheckpoint(ctx context.Context, tx pgx.Tx, offset int
 
 // flushBatch applies a batch of records during CDC-only mode.
 func (r *Reconciler) flushBatch(ctx context.Context, records []kafka.Record) error {
+	if err := r.checkBatchBounds(records); err != nil {
+		return err
+	}
 	groups := groupByTransaction(records)
 	for _, group := range groups {
 		if err := r.applySourceTransaction(ctx, group, false); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// checkBatchBounds enforces the configured per-batch record limit. The kafka
+// consumer already bounds polls; this is a defensive check that fails fast if
+// a misconfigured consumer hands Seam an oversized batch (a source of
+// unbounded memory).
+func (r *Reconciler) checkBatchBounds(records []kafka.Record) error {
+	if n := len(records); r.cfg.MaxRecordsPerBatch > 0 && n > r.cfg.MaxRecordsPerBatch {
+		return fmt.Errorf("batch of %d records exceeds max records per batch %d", n, r.cfg.MaxRecordsPerBatch)
 	}
 	return nil
 }
@@ -641,5 +661,3 @@ func (r *Reconciler) maybeWait(ctx context.Context, name failpoint.Name) error {
 	log.Printf("seam: failpoint resumed at %s", p)
 	return nil
 }
-
-
