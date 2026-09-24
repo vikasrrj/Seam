@@ -1,6 +1,7 @@
 package scan
 
 import (
+	"context"
 	"math"
 	"strings"
 	"testing"
@@ -42,36 +43,36 @@ func TestNextChunk(t *testing.T) {
 }
 
 func TestNewChunkReaderFor_ValidatesIdentifiers(t *testing.T) {
-	valid := []struct{ table, key string }{
-		{"accounts", "id"},
-		{"payments", "account_id"},
-		{"_internal", "_key"},
+	// Invalid table names are rejected before any connection is attempted.
+	// Primary-key names are no longer operator input: they come from the
+	// catalog descriptor, so they are injection-safe by construction.
+	invalid := []string{
+		"accounts; DROP TABLE accounts",
+		"accounts ",
+		"public.accounts",
+		"",
+		"account-list",
 	}
-	// Keys must be injected safely; anything but a plain identifier is refused.
-	invalid := []struct{ table, key string }{
-		{"accounts; DROP TABLE accounts", "id"},
-		{"accounts ", "id"},
-		{"public.accounts", "id"},
-		{"accounts", "id; SELECT 1"},
-		{"accounts", "id\"--"},
-		{"accounts", ""},
-		{"", "id"},
-		{"account-list", "id"},
-		{"accounts", "id order by 1"},
-	}
-	for _, v := range valid {
-		if _, err := NewChunkReaderFor("dsn", v.table, v.key); err != nil {
-			t.Fatalf("NewChunkReaderFor(%q, %q) unexpected error: %v", v.table, v.key, err)
+	for _, table := range invalid {
+		if _, err := NewChunkReaderFor(context.Background(), "dsn", table); err == nil || !strings.Contains(err.Error(), "identifier") {
+			t.Fatalf("NewChunkReaderFor(%q) expected identifier rejection, got %v", table, err)
 		}
 	}
-	for _, v := range invalid {
-		if _, err := NewChunkReaderFor("dsn", v.table, v.key); err == nil {
-			t.Fatalf("NewChunkReaderFor(%q, %q) expected error", v.table, v.key)
+	// Valid identifiers pass identifier validation and fail only when the
+	// catalog connection is unreachable ("dsn" is not a real DSN), proving
+	// valid names were not rejected syntactically.
+	for _, table := range []string{"accounts", "payments", "_internal"} {
+		if _, err := NewChunkReaderFor(context.Background(), "dsn", table); err == nil || strings.Contains(err.Error(), "identifier") {
+			t.Fatalf("NewChunkReaderFor(%q) expected a connection error, got %v", table, err)
 		}
 	}
 }
 
 func TestKeysetQueriesArePaginationAnchored(t *testing.T) {
+	first := firstChunkQuery("accounts", "id", 1000)
+	if strings.Contains(first, "id >") || !strings.Contains(first, "id <= $1") {
+		t.Fatalf("first page excludes the minimum int64 key: %s", first)
+	}
 	// The next-chunk query must be keyset based: a strictly-greater-than
 	// predicate anchored on the last key. OFFSET-based pagination degrades as
 	// the table grows and must never appear.

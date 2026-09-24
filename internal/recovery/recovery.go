@@ -4,7 +4,6 @@ package recovery
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/model"
@@ -35,65 +34,60 @@ func Recover(ctx context.Context, cpStore *checkpoint.Store, jobID string, expec
 	if cp == nil {
 		return nil, fmt.Errorf("checkpoint missing for job %q", jobID)
 	}
-
-	if rec.Config.SourceDSN != expectedSourceDSN {
-		return nil, fmt.Errorf("source dsn mismatch: expected %q, stored %q", expectedSourceDSN, rec.Config.SourceDSN)
+	if !cp.Active {
+		return nil, fmt.Errorf("job %q is inactive after promotion", jobID)
 	}
 
-	// Validate that destination schema fingerprint has not changed.
+	if rec.SourceDSNHash == "" || rec.SourceDSNHash != checkpoint.DSNFingerprint(expectedSourceDSN) {
+		return nil, fmt.Errorf("source connection fingerprint changed or was never recorded; resnapshot required")
+	}
+
+	// Validate that destination schema epoch has not changed. The fingerprint
+	// is derived from the job's durable source descriptor, so drift on either
+	// side of the pipeline fails closed.
 	conn, err := cpStore.Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close(context.Background())
-	fp, err := checkpoint.Fingerprint(ctx, conn)
+	if rec.SourceSchema == nil {
+		return nil, fmt.Errorf("job %q has no durable source schema descriptor; resnapshot required", jobID)
+	}
+	fp, err := checkpoint.FingerprintFor(ctx, conn, rec.Config.DestTable, rec.SourceSchema)
 	if err != nil {
 		return nil, fmt.Errorf("fingerprint destination schema: %w", err)
+	}
+	if rec.SourceSchemaFingerprint != "" && fp != rec.SourceSchemaFingerprint {
+		return nil, fmt.Errorf("destination schema epoch drifted: expected %s, current %s", rec.SourceSchemaFingerprint, fp)
 	}
 	if fp != rec.SchemaFingerprint {
 		return nil, fmt.Errorf("schema fingerprint mismatch: expected %s, current %s", rec.SchemaFingerprint, fp)
 	}
 
 	// Hard-fail if the replication slot has disappeared (broken CDC history).
-	if err := checkSlotContinuity(ctx, rec.Config.SourceDSN, rec.Config.SourceSlot); err != nil {
+	if err := checkSlotContinuity(ctx, expectedSourceDSN, rec.Config.SourceSlot); err != nil {
 		return nil, err
 	}
 
-	// Recover durable chunk state. Expired leases are released so another
-	// worker can pick the chunk up safely.
-	if _, err := cpStore.ReleaseExpiredLeases(ctx, jobID, time.Now()); err != nil {
-		return nil, fmt.Errorf("release expired leases: %w", err)
-	}
-
-	incomplete, err := cpStore.LoadIncompleteChunks(ctx, jobID)
+	incomplete, err := cpStore.HasIncompleteChunks(ctx, jobID, cp.Attempt)
 	if err != nil {
 		return nil, fmt.Errorf("load incomplete chunks: %w", err)
 	}
 
 	// If a chunk was unfinished, start a fresh attempt with a new marker window.
-	if cp.CompletedThrough < cp.ScanUpperBound || len(incomplete) > 0 {
+	if cp.CompletedThrough < cp.ScanUpperBound && !incomplete {
+		return nil, fmt.Errorf("job %q has no remaining chunks but backfill frontier %d is below upper bound %d; discovery or chunk state is incomplete", jobID, cp.CompletedThrough, cp.ScanUpperBound)
+	}
+	if incomplete {
 		newAttempt, err := BumpAttempt(cp.Attempt)
 		if err != nil {
 			return nil, err
 		}
+		if err := cpStore.BeginAttemptOwned(ctx, cp, cp.Attempt, newAttempt, cp.NextKafkaOffset); err != nil {
+			return nil, fmt.Errorf("begin recovery attempt: %w", err)
+		}
 		cp.Attempt = newAttempt
 		logPrintf("recovery: unfinished chunk detected, new attempt=%s", cp.Attempt)
-
-		// Re-schedule any incomplete chunk under the new attempt. Completed
-		// chunks are left alone; workers will not re-scan them.
-		for _, ch := range incomplete {
-			newChunk := ch
-			newChunk.Attempt = newAttempt
-			newChunk.Status = model.ChunkPending
-			newChunk.WorkerID = ""
-			newChunk.LeaseStart = nil
-			newChunk.LeaseExpiry = nil
-			newChunk.HeartbeatAt = nil
-			newChunk.ErrorMessage = ""
-			if err := cpStore.CreateChunk(ctx, &newChunk); err != nil {
-				return nil, fmt.Errorf("reschedule chunk %s: %w", ch.Range(), err)
-			}
-		}
 	}
 
 	return &Result{Checkpoint: cp, Record: rec}, nil

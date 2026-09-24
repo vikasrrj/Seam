@@ -55,6 +55,12 @@ func (s *Store) WriteHigh(ctx context.Context, jobID, attempt string, chunk mode
 	return s.write(ctx, "high", jobID, attempt, chunk)
 }
 
+// WriteBarrier creates a unique source transaction used to prove that the
+// capture slot and Kafka stream were connected before a new scan begins.
+func (s *Store) WriteBarrier(ctx context.Context, jobID, attempt string) (string, error) {
+	return s.write(ctx, "barrier", jobID, attempt, model.ChunkRange{})
+}
+
 func (s *Store) write(ctx context.Context, kind, jobID, attempt string, chunk model.ChunkRange) (string, error) {
 	id := fmt.Sprintf("%s:%s:%s:%d:%d:%d", jobID, attempt, kind, chunk.Min, chunk.Max, time.Now().UnixNano())
 	_, err := retry.Do(ctx, retry.DefaultConfig(), func() (struct{}, error) {

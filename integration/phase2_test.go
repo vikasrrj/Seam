@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"example.com/seam/integration/itest"
 	"example.com/seam/internal/capture"
 	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/failpoint"
@@ -18,12 +19,11 @@ import (
 	"example.com/seam/internal/reconcile"
 	"example.com/seam/internal/scan"
 	"example.com/seam/internal/sink"
-	"example.com/seam/integration/itest"
 )
 
 // phase2Run drives one chunk with a failpoint and returns the reconciler and
 // channels so callers can verify races.
-func phase2Run(t *testing.T, disableEviction bool) (*reconcile.Reconciler, func(), *checkpoint.Store, context.CancelFunc, *failpoint.Registry) {
+func phase2Run(t *testing.T, disableEviction bool) (*reconcile.Reconciler, func(), *checkpoint.Store, context.CancelFunc, *failpoint.Registry, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	t.Cleanup(cancel)
 
@@ -80,8 +80,9 @@ func phase2Run(t *testing.T, disableEviction bool) (*reconcile.Reconciler, func(
 		}
 	})
 
+	jobID := itest.JobID("phase2")
 	jobCfg := model.JobConfig{
-		JobID:             "phase2",
+		JobID:             jobID,
 		SourceDSN:         itest.SourceDSN(),
 		SourceReplDSN:     itest.SourceReplDSN(),
 		SourceSlot:        "seam_itest_slot",
@@ -95,11 +96,19 @@ func phase2Run(t *testing.T, disableEviction bool) (*reconcile.Reconciler, func(
 	if err := cpStore.EnsureTables(ctx); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
-	upperBound, err := scan.NewChunkReader(itest.SourceDSN()).UpperBound(ctx)
+	chunkReader, err := scan.NewChunkReader(ctx, itest.SourceDSN())
+	if err != nil {
+		t.Fatalf("chunk reader: %v", err)
+	}
+	upperBound, err := chunkReader.UpperBound(ctx)
 	if err != nil {
 		t.Fatalf("upper bound: %v", err)
 	}
-	cp, err := cpStore.CreateJob(ctx, jobCfg, upperBound)
+	mutator, err := sink.NewMutatorFor("accounts", chunkReader.Schema())
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	cp, err := cpStore.CreateJob(ctx, jobCfg, chunkReader.Schema(), upperBound)
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
@@ -122,8 +131,9 @@ func phase2Run(t *testing.T, disableEviction bool) (*reconcile.Reconciler, func(
 		Consumer:        consumer,
 		CheckpointStore: cpStore,
 		MarkerStore:     marker.NewStore(itest.SourceDSN()),
-		Scanner:         scan.NewChunkReader(itest.SourceDSN()),
-		Sink:            sink.NewMutator(),
+		Scanner:         chunkReader,
+		Sink:            mutator,
+		SourceSchema:    chunkReader.Schema(),
 		Failpoints:      fp,
 		DisableEviction: disableEviction,
 	})
@@ -146,13 +156,13 @@ func phase2Run(t *testing.T, disableEviction bool) (*reconcile.Reconciler, func(
 	}
 	t.Cleanup(stop)
 
-	return rec, func() { fp.Resume(failpoint.AfterChunkReadBeforeReconciliation) }, cpStore, recCancel, fp
+	return rec, func() { fp.Resume(failpoint.AfterChunkReadBeforeReconciliation) }, cpStore, recCancel, fp, jobID
 }
 
 // TestPhase2_NaiveStaleUpdate demonstrates that without candidate eviction the
 // snapshot overwrites a concurrent update.
 func TestPhase2_NaiveStaleUpdate(t *testing.T) {
-	_, resume, cpStore, cancel, fp := phase2Run(t, true)
+	_, resume, cpStore, cancel, fp, jobID := phase2Run(t, true)
 	defer cancel()
 
 	ctx, done := context.WithTimeout(context.Background(), 30*time.Second)
@@ -175,7 +185,7 @@ func TestPhase2_NaiveStaleUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
 	}
-	defer dst.Close(context.Background())
+	itest.CloseOnCleanup(t, "destination connection", dst)
 
 	// Wait for CDC to apply the update.
 	for i := 0; i < 40; i++ {
@@ -192,7 +202,7 @@ func TestPhase2_NaiveStaleUpdate(t *testing.T) {
 	// Wait for the chunk to complete.
 	for i := 0; i < 40; i++ {
 		var completed int64
-		if err := dst.QueryRow(ctx, `SELECT completed_through_id FROM seam_checkpoints WHERE job_id = 'phase2'`).Scan(&completed); err == nil && completed >= 4 {
+		if err := dst.QueryRow(ctx, `SELECT completed_through_id FROM seam_checkpoints WHERE job_id = $1`, jobID).Scan(&completed); err == nil && completed >= 4 {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -213,7 +223,7 @@ func TestPhase2_NaiveStaleUpdate(t *testing.T) {
 // TestPhase2_NaiveDeleteResurrection demonstrates that without candidate
 // eviction the snapshot resurrects a concurrent delete.
 func TestPhase2_NaiveDeleteResurrection(t *testing.T) {
-	_, resume, cpStore, cancel, fp := phase2Run(t, true)
+	_, resume, cpStore, cancel, fp, jobID := phase2Run(t, true)
 	defer cancel()
 
 	ctx, done := context.WithTimeout(context.Background(), 30*time.Second)
@@ -236,7 +246,7 @@ func TestPhase2_NaiveDeleteResurrection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
 	}
-	defer dst.Close(context.Background())
+	itest.CloseOnCleanup(t, "destination connection", dst)
 
 	// Wait for CDC to apply the delete.
 	for i := 0; i < 40; i++ {
@@ -253,7 +263,7 @@ func TestPhase2_NaiveDeleteResurrection(t *testing.T) {
 	// Wait for the chunk to complete.
 	for i := 0; i < 40; i++ {
 		var completed int64
-		if err := dst.QueryRow(ctx, `SELECT completed_through_id FROM seam_checkpoints WHERE job_id = 'phase2'`).Scan(&completed); err == nil && completed >= 4 {
+		if err := dst.QueryRow(ctx, `SELECT completed_through_id FROM seam_checkpoints WHERE job_id = $1`, jobID).Scan(&completed); err == nil && completed >= 4 {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)

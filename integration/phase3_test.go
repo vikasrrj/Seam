@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"example.com/seam/integration/itest"
 	"example.com/seam/internal/capture"
 	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/failpoint"
@@ -18,11 +19,10 @@ import (
 	"example.com/seam/internal/reconcile"
 	"example.com/seam/internal/scan"
 	"example.com/seam/internal/sink"
-	"example.com/seam/integration/itest"
 )
 
 // phase3Run sets up a backfill with chunk size 5 over ids 1-10.
-func phase3Run(t *testing.T) (*reconcile.Reconciler, func(), *checkpoint.Store, context.CancelFunc, *failpoint.Registry) {
+func phase3Run(t *testing.T) (*reconcile.Reconciler, func(), *checkpoint.Store, context.CancelFunc, *failpoint.Registry, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	t.Cleanup(cancel)
 
@@ -79,8 +79,9 @@ func phase3Run(t *testing.T) (*reconcile.Reconciler, func(), *checkpoint.Store, 
 		}
 	})
 
+	jobID := itest.JobID("phase3")
 	jobCfg := model.JobConfig{
-		JobID:             "phase3",
+		JobID:             jobID,
 		SourceDSN:         itest.SourceDSN(),
 		SourceReplDSN:     itest.SourceReplDSN(),
 		SourceSlot:        "seam_itest_slot",
@@ -94,11 +95,19 @@ func phase3Run(t *testing.T) (*reconcile.Reconciler, func(), *checkpoint.Store, 
 	if err := cpStore.EnsureTables(ctx); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
-	upperBound, err := scan.NewChunkReader(itest.SourceDSN()).UpperBound(ctx)
+	chunkReader, err := scan.NewChunkReader(ctx, itest.SourceDSN())
+	if err != nil {
+		t.Fatalf("chunk reader: %v", err)
+	}
+	upperBound, err := chunkReader.UpperBound(ctx)
 	if err != nil {
 		t.Fatalf("upper bound: %v", err)
 	}
-	cp, err := cpStore.CreateJob(ctx, jobCfg, upperBound)
+	mutator, err := sink.NewMutatorFor("accounts", chunkReader.Schema())
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	cp, err := cpStore.CreateJob(ctx, jobCfg, chunkReader.Schema(), upperBound)
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
@@ -121,8 +130,9 @@ func phase3Run(t *testing.T) (*reconcile.Reconciler, func(), *checkpoint.Store, 
 		Consumer:        consumer,
 		CheckpointStore: cpStore,
 		MarkerStore:     marker.NewStore(itest.SourceDSN()),
-		Scanner:         scan.NewChunkReader(itest.SourceDSN()),
-		Sink:            sink.NewMutator(),
+		Scanner:         chunkReader,
+		Sink:            mutator,
+		SourceSchema:    chunkReader.Schema(),
 		Failpoints:      fp,
 	})
 
@@ -144,7 +154,7 @@ func phase3Run(t *testing.T) (*reconcile.Reconciler, func(), *checkpoint.Store, 
 	}
 	t.Cleanup(stop)
 
-	return rec, func() { fp.Resume(failpoint.AfterChunkReadBeforeReconciliation) }, cpStore, recCancel, fp
+	return rec, func() { fp.Resume(failpoint.AfterChunkReadBeforeReconciliation) }, cpStore, recCancel, fp, jobID
 }
 
 func waitForCheckpoint(t *testing.T, jobID string, min int64) {
@@ -154,7 +164,7 @@ func waitForCheckpoint(t *testing.T, jobID string, min int64) {
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
 	}
-	defer dst.Close(context.Background())
+	itest.CloseOnCleanup(t, "destination connection", dst)
 	for i := 0; i < 120; i++ {
 		var completed int64
 		if err := dst.QueryRow(ctx, `SELECT completed_through_id FROM seam_checkpoints WHERE job_id = $1`, jobID).Scan(&completed); err == nil && completed >= min {
@@ -167,7 +177,7 @@ func waitForCheckpoint(t *testing.T, jobID string, min int64) {
 
 // TestPhase3_ReconciledUpdate proves a concurrent update is not overwritten.
 func TestPhase3_ReconciledUpdate(t *testing.T) {
-	_, resume, _, cancel, fp := phase3Run(t)
+	_, resume, _, cancel, fp, jobID := phase3Run(t)
 	defer cancel()
 
 	ctx, done := context.WithTimeout(context.Background(), 30*time.Second)
@@ -187,13 +197,13 @@ func TestPhase3_ReconciledUpdate(t *testing.T) {
 	src.Close(context.Background())
 
 	resume()
-	waitForCheckpoint(t, "phase3", 4)
+	waitForCheckpoint(t, jobID, 4)
 
 	dst, err := itest.DestConn(ctx)
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
 	}
-	defer dst.Close(context.Background())
+	itest.CloseOnCleanup(t, "destination connection", dst)
 
 	var owner string
 	if err := dst.QueryRow(ctx, `SELECT owner FROM accounts WHERE id = 3`).Scan(&owner); err != nil {
@@ -207,7 +217,7 @@ func TestPhase3_ReconciledUpdate(t *testing.T) {
 
 // TestPhase3_ReconciledDelete proves a concurrent delete is not resurrected.
 func TestPhase3_ReconciledDelete(t *testing.T) {
-	_, resume, _, cancel, fp := phase3Run(t)
+	_, resume, _, cancel, fp, jobID := phase3Run(t)
 	defer cancel()
 
 	ctx, done := context.WithTimeout(context.Background(), 30*time.Second)
@@ -227,13 +237,13 @@ func TestPhase3_ReconciledDelete(t *testing.T) {
 	src.Close(context.Background())
 
 	resume()
-	waitForCheckpoint(t, "phase3", 4)
+	waitForCheckpoint(t, jobID, 4)
 
 	dst, err := itest.DestConn(ctx)
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
 	}
-	defer dst.Close(context.Background())
+	itest.CloseOnCleanup(t, "destination connection", dst)
 
 	var exists bool
 	if err := dst.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accounts WHERE id = 3)`).Scan(&exists); err != nil {
@@ -248,7 +258,7 @@ func TestPhase3_ReconciledDelete(t *testing.T) {
 // TestPhase3_UnrelatedCDCEvent proves CDC events for keys outside the chunk
 // do not evict candidates and are still applied in order.
 func TestPhase3_UnrelatedCDCEvent(t *testing.T) {
-	_, resume, _, cancel, fp := phase3Run(t)
+	_, resume, _, cancel, fp, jobID := phase3Run(t)
 	defer cancel()
 
 	ctx, done := context.WithTimeout(context.Background(), 30*time.Second)
@@ -270,13 +280,13 @@ func TestPhase3_UnrelatedCDCEvent(t *testing.T) {
 	src.Close(context.Background())
 
 	resume()
-	waitForCheckpoint(t, "phase3", 4)
+	waitForCheckpoint(t, jobID, 4)
 
 	dst, err := itest.DestConn(ctx)
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
 	}
-	defer dst.Close(context.Background())
+	itest.CloseOnCleanup(t, "destination connection", dst)
 
 	// Candidate rows in [0,4] should be present with original values.
 	for i := int64(1); i <= 4; i++ {

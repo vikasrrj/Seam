@@ -1,58 +1,74 @@
-// Package scan reads bounded primary-key chunks from the source accounts table.
+// Package scan reads bounded primary-key chunks from a source table.
 package scan
 
 import (
 	"context"
 	"fmt"
-	"regexp"
 
 	"example.com/seam/internal/model"
 	"example.com/seam/internal/retry"
+	"example.com/seam/internal/schema"
 	"example.com/seam/internal/transport"
 	"github.com/jackc/pgx/v5"
 )
 
-// identPattern matches PostgreSQL identifiers Seam is willing to interpolate
-// into SQL. Anything else is rejected to keep generated SQL injection-safe.
-var identPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-
-// DefaultChunkReaderTable is the source table the built-in readers scan.
+// DefaultChunkReaderTable is the source table the built-in readers scan when
+// none is configured.
 const DefaultChunkReaderTable = "accounts"
 
-// DefaultChunkReaderKey is the primary-key column used for keyset pagination.
-const DefaultChunkReaderKey = "id"
-
-// ChunkReader performs keyset pagination over the source table. It never uses
-// OFFSET: every page is anchored on the strictly-greater-than predicate of the
-// previous page's last key, which keeps page cost independent of table size.
+// ChunkReader performs keyset pagination over a source table, keyed by the
+// primary key the durable schema descriptor pins. It never uses OFFSET: every
+// page is anchored on the strictly-greater-than predicate of the previous
+// page's last key, which keeps page cost independent of table size.
 type ChunkReader struct {
-	dsn       string
-	table     string
-	keyColumn string
+	dsn      string
+	schema   *schema.Schema
+	key      string
+	table    string
+	maxRows  int
+	maxBytes int64
 }
 
-// NewChunkReader returns a reader over the default accounts table keyed by id.
-func NewChunkReader(dsn string) *ChunkReader {
-	r, err := NewChunkReaderFor(dsn, DefaultChunkReaderTable, DefaultChunkReaderKey)
+// SetLimits bounds one in-flight scan before it has accumulated a full chunk.
+// The byte estimate includes row overhead plus canonical cell text.
+func (r *ChunkReader) SetLimits(maxRows int, maxBytes int64) error {
+	if maxRows < 1 || maxBytes < 1 {
+		return fmt.Errorf("scan: candidate limits must be positive")
+	}
+	r.maxRows, r.maxBytes = maxRows, maxBytes
+	return nil
+}
+
+// NewChunkReader returns a reader over the default accounts table. The durable
+// descriptor is loaded eagerly so the chunking queries and column lists are
+// proven against the catalog before the job starts.
+func NewChunkReader(ctx context.Context, dsn string) (*ChunkReader, error) {
+	return NewChunkReaderFor(ctx, dsn, DefaultChunkReaderTable)
+}
+
+// NewChunkReaderFor returns a keyset reader over the named table. The table's
+// schema is loaded from the source catalog and validated against the supported
+// type set; anything else fails closed before a connection is made.
+func NewChunkReaderFor(ctx context.Context, dsn, table string) (*ChunkReader, error) {
+	descriptor, err := schema.Load(ctx, dsn, "public", table)
 	if err != nil {
-		// Defaults are validated constants; this cannot fail.
-		panic(fmt.Sprintf("scan: invalid default reader config: %v", err))
+		return nil, fmt.Errorf("scan: load schema for public.%s: %w", table, err)
 	}
-	return r
+	pk := descriptor.PKColumn()
+	if pk == nil {
+		return nil, fmt.Errorf("scan: public.%s has no primary key", table)
+	}
+	return &ChunkReader{
+		dsn:    dsn,
+		schema: descriptor,
+		key:    pk.Name,
+		table:  table,
+	}, nil
 }
 
-// NewChunkReaderFor returns a keyset reader over an arbitrary table and key
-// column. table and keyColumn must be plain identifiers (letters, digits,
-// underscores); anything else is rejected before a connection is made.
-func NewChunkReaderFor(dsn, table, keyColumn string) (*ChunkReader, error) {
-	if !identPattern.MatchString(table) {
-		return nil, fmt.Errorf("scan: invalid table name %q", table)
-	}
-	if !identPattern.MatchString(keyColumn) {
-		return nil, fmt.Errorf("scan: invalid key column %q", keyColumn)
-	}
-	return &ChunkReader{dsn: dsn, table: table, keyColumn: keyColumn}, nil
-}
+// Schema exposes the validated source descriptor, so callers can verify rows
+// against the same fingerprint the job recorded.
+func (r *ChunkReader) Schema() *schema.Schema { return r.schema }
 
 func (r *ChunkReader) conn(ctx context.Context) (*pgx.Conn, error) {
 	return transport.ConnectPostgres(ctx, r.dsn)
@@ -68,7 +84,7 @@ func (r *ChunkReader) UpperBound(ctx context.Context) (int64, error) {
 		}
 		defer conn.Close(context.Background())
 		var max *int64
-		if err := conn.QueryRow(ctx, upperBoundQuery(r.table, r.keyColumn)).Scan(&max); err != nil {
+		if err := conn.QueryRow(ctx, upperBoundQuery(r.schema.TableQualified(), r.key)).Scan(&max); err != nil {
 			return 0, err
 		}
 		if max == nil {
@@ -89,6 +105,19 @@ type chunkResult struct {
 // < id <= upperBound; rows beyond the backfill upper bound are delivered via
 // CDC only and must never be chunked. If no rows remain, it returns false.
 func (r *ChunkReader) NextChunk(ctx context.Context, completedThrough, upperBound int64, chunkSize int) (model.ChunkRange, bool, error) {
+	return r.NextChunkFrom(ctx, &completedThrough, upperBound, chunkSize)
+}
+
+// NextChunkFrom accepts a nil cursor for the first page. A numeric sentinel
+// would exclude a real row whose key is math.MinInt64.
+func (r *ChunkReader) NextChunkFrom(ctx context.Context, cursor *int64, upperBound int64, chunkSize int) (model.ChunkRange, bool, error) {
+	if chunkSize < 1 {
+		return model.ChunkRange{}, false, fmt.Errorf("scan: chunk size must be positive")
+	}
+	if cursor != nil && *cursor >= upperBound {
+		return model.ChunkRange{}, false, nil
+	}
+	table := r.schema.TableQualified()
 	res, err := retry.Do(ctx, retry.DefaultConfig(), func() (chunkResult, error) {
 		conn, err := r.conn(ctx)
 		if err != nil {
@@ -97,10 +126,14 @@ func (r *ChunkReader) NextChunk(ctx context.Context, completedThrough, upperBoun
 		defer conn.Close(context.Background())
 
 		var minID, maxID *int64
-		if err := conn.QueryRow(ctx,
-			nextChunkQuery(r.table, r.keyColumn, chunkSize),
-			completedThrough, upperBound).Scan(&minID, &maxID); err != nil {
-			return chunkResult{}, fmt.Errorf("find next chunk after %d: %w", completedThrough, err)
+		query := firstChunkQuery(table, r.key, chunkSize)
+		args := []any{upperBound}
+		if cursor != nil {
+			query = nextChunkQuery(table, r.key, chunkSize)
+			args = []any{*cursor, upperBound}
+		}
+		if err := conn.QueryRow(ctx, query, args...).Scan(&minID, &maxID); err != nil {
+			return chunkResult{}, fmt.Errorf("find next chunk after %v: %w", cursor, err)
 		}
 		if minID == nil || maxID == nil {
 			return chunkResult{}, nil
@@ -113,33 +146,44 @@ func (r *ChunkReader) NextChunk(ctx context.Context, completedThrough, upperBoun
 	return res.chunk, res.ok, nil
 }
 
-// ReadChunk reads all rows with key in [minID, maxID] inclusive.
-func (r *ChunkReader) ReadChunk(ctx context.Context, minID, maxID int64) ([]model.Account, error) {
-	return retry.Do(ctx, retry.DefaultConfig(), func() ([]model.Account, error) {
+func firstChunkQuery(table, key string, chunkSize int) string {
+	return fmt.Sprintf(
+		`SELECT MIN(%[2]s), MAX(%[2]s) FROM (SELECT %[2]s FROM %[1]s WHERE %[2]s <= $1 ORDER BY %[2]s LIMIT %[3]d) sub`,
+		table, key, chunkSize)
+}
+
+// ReadChunk reads all rows with key in [minID, maxID] inclusive as canonical
+// text under a UTC session, and returns them as positional model.Row values.
+func (r *ChunkReader) ReadChunk(ctx context.Context, minID, maxID int64) ([]model.Row, error) {
+	return retry.Do(ctx, retry.DefaultConfig(), func() ([]model.Row, error) {
 		conn, err := r.conn(ctx)
 		if err != nil {
 			return nil, err
 		}
 		defer conn.Close(context.Background())
 
-		rows, err := conn.Query(ctx, readChunkQuery(r.table, r.keyColumn), minID, maxID)
+		rows, err := r.schema.ScanRows(ctx, conn, minID, maxID)
 		if err != nil {
-			return nil, fmt.Errorf("query chunk [%d,%d]: %w", minID, maxID, err)
+			return nil, fmt.Errorf("read chunk [%d,%d]: %w", minID, maxID, err)
 		}
-		defer rows.Close()
-
-		var result []model.Account
-		for rows.Next() {
-			var account model.Account
-			if err := rows.Scan(&account.ID, &account.Owner, &account.BalanceCents); err != nil {
-				return nil, fmt.Errorf("scan row: %w", err)
+		if r.maxRows > 0 && len(rows) > r.maxRows {
+			return nil, fmt.Errorf("chunk [%d,%d] exceeds %d-row scan limit", minID, maxID, r.maxRows)
+		}
+		if r.maxBytes > 0 {
+			var estimated int64
+			for _, row := range rows {
+				estimated += 96
+				for _, v := range row.Values {
+					if v.Kind == model.ValueText {
+						estimated += int64(len(v.Text))
+					}
+				}
 			}
-			result = append(result, account)
+			if estimated > r.maxBytes {
+				return nil, fmt.Errorf("chunk [%d,%d] exceeds %d-byte scan budget", minID, maxID, r.maxBytes)
+			}
 		}
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-		return result, nil
+		return rows, nil
 	}, retry.IsRetryablePG)
 }
 
@@ -156,13 +200,6 @@ func nextChunkQuery(table, key string, chunkSize int) string {
 	return fmt.Sprintf(
 		`SELECT MIN(%[2]s), MAX(%[2]s) FROM (SELECT %[2]s FROM %[1]s WHERE %[2]s > $1 AND %[2]s <= $2 ORDER BY %[2]s LIMIT %[3]d) sub`,
 		table, key, chunkSize)
-}
-
-// readChunkQuery builds the in-chunk read query for a table/key pair.
-func readChunkQuery(table, key string) string {
-	return fmt.Sprintf(
-		`SELECT id, owner, balance_cents FROM %[1]s WHERE %[2]s >= $1 AND %[2]s <= $2 ORDER BY %[2]s`,
-		table, key)
 }
 
 // NextChunk is the legacy helper that computes the next interval without

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"example.com/seam/integration/itest"
 	"example.com/seam/internal/capture"
 	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/kafka"
@@ -19,7 +20,6 @@ import (
 	"example.com/seam/internal/recovery"
 	"example.com/seam/internal/scan"
 	"example.com/seam/internal/sink"
-	"example.com/seam/integration/itest"
 )
 
 // TestChaos_CrashRestart verifies source == destination after concurrent random
@@ -81,7 +81,7 @@ func TestChaos_CrashRestart(t *testing.T) {
 	}()
 
 	jobCfg := model.JobConfig{
-		JobID:             "chaos",
+		JobID:             itest.JobID("chaos"),
 		SourceDSN:         itest.SourceDSN(),
 		SourceReplDSN:     itest.SourceReplDSN(),
 		SourceSlot:        "seam_itest_slot",
@@ -90,17 +90,36 @@ func TestChaos_CrashRestart(t *testing.T) {
 		KafkaBrokers:      itest.KafkaBrokers(),
 		KafkaTopic:        itest.KafkaTopic(),
 		ChunkSize:         7,
+		Workers:           1,
+		WorkerID:          "chaos-worker",
+		LeaseDuration:     10 * time.Second,
+		HeartbeatInterval: 2 * time.Second,
 	}
 	cpStore := checkpoint.NewStore(itest.DestDSN())
 	if err := cpStore.EnsureTables(ctx); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
-	upperBound, err := scan.NewChunkReader(itest.SourceDSN()).UpperBound(ctx)
+	chunkReader, err := scan.NewChunkReader(ctx, itest.SourceDSN())
+	if err != nil {
+		t.Fatalf("chunk reader: %v", err)
+	}
+	upperBound, err := chunkReader.UpperBound(ctx)
 	if err != nil {
 		t.Fatalf("upper bound: %v", err)
 	}
-	if _, err := cpStore.CreateJob(ctx, jobCfg, upperBound); err != nil {
+	mutator, err := sink.NewMutatorFor("accounts", chunkReader.Schema())
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	cp, err := cpStore.CreateJob(ctx, jobCfg, chunkReader.Schema(), upperBound)
+	if err != nil {
 		t.Fatalf("create job: %v", err)
+	}
+	// The job is durable state: recovery and the restart loop below expect a
+	// sealed chunk manifest. Discovery must run before any reconciler starts,
+	// mirroring the production --start-fresh path.
+	if err := cpStore.DiscoverAndCreateChunks(ctx, cp.JobID, cp.Attempt, itest.SourceDSN(), chunkReader.Schema(), upperBound, jobCfg.ChunkSize); err != nil {
+		t.Fatalf("discover chunks: %v", err)
 	}
 
 	// startReconciler starts the reconciler from the given checkpoint and returns
@@ -119,9 +138,11 @@ func TestChaos_CrashRestart(t *testing.T) {
 			Checkpoint:      checkpoint,
 			Consumer:        consumer,
 			CheckpointStore: cpStore,
+			ChunkStore:      cpStore,
 			MarkerStore:     marker.NewStore(itest.SourceDSN()),
-			Scanner:         scan.NewChunkReader(itest.SourceDSN()),
-			Sink:            sink.NewMutator(),
+			Scanner:         chunkReader,
+			Sink:            mutator,
+			SourceSchema:    chunkReader.Schema(),
 		})
 		recErr := make(chan error, 1)
 		go func() {
@@ -134,9 +155,10 @@ func TestChaos_CrashRestart(t *testing.T) {
 		return recCancel, recErr
 	}
 
-	// Reconciler restart loop. A separate signal channel lets the chaos goroutine
-	// crash only the current reconciler instance without stopping the loop.
-	restartCh := make(chan struct{})
+	// Reconciler restart loop. The bounded channel avoids racing on a channel
+	// variable while still letting the writer request a crash of the current
+	// instance. A second request waits until the loop accepted the first.
+	restartCh := make(chan struct{}, 1)
 	recErrCh := make(chan error, 1)
 	loopCtx, loopCancel := context.WithCancel(ctx)
 	go func() {
@@ -157,6 +179,7 @@ func TestChaos_CrashRestart(t *testing.T) {
 			cancel, ch := startReconciler(recCtx, latest)
 			select {
 			case err := <-ch:
+				recCancel()
 				_ = cancel
 				if err != nil && !errors.Is(err, context.Canceled) {
 					recErrCh <- err
@@ -185,12 +208,14 @@ func TestChaos_CrashRestart(t *testing.T) {
 		}
 	}()
 
-	// Chaos: random mutations and occasional reconciler crashes.
-	mutationCtx, stopMutations := context.WithCancel(ctx)
+	// Chaos: a fixed seed and operation count make failures replayable. Crashes
+	// are requested at exact operation boundaries rather than wall-clock times.
+	const mutationSeed int64 = 20260924
+	const mutationCount = 600
 	var maxID int64 = 20
 	mutErr := make(chan error, 1)
 	go func() {
-		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		rng := rand.New(rand.NewSource(mutationSeed))
 		src, err := itest.SourceConn(ctx)
 		if err != nil {
 			mutErr <- err
@@ -198,22 +223,7 @@ func TestChaos_CrashRestart(t *testing.T) {
 		}
 		defer src.Close(context.Background())
 
-		nextCrash := time.After(4 * time.Second)
-		crashCount := 0
-		mutations := 0
-		for mutationCtx.Err() == nil {
-			select {
-			case <-nextCrash:
-				if crashCount < 3 {
-					crashCount++
-					close(restartCh)
-					restartCh = make(chan struct{})
-					nextCrash = time.After(4 * time.Second)
-					continue
-				}
-			default:
-			}
-
+		for mutations := 0; mutations < mutationCount; mutations++ {
 			op := rng.Intn(4)
 			switch op {
 			case 0: // insert
@@ -247,27 +257,45 @@ func TestChaos_CrashRestart(t *testing.T) {
 					return
 				}
 			}
-			mutations++
-			if mutations%50 == 0 {
-				time.Sleep(5 * time.Millisecond)
+			done := mutations + 1
+			if done == 150 || done == 300 || done == 450 {
+				select {
+				case restartCh <- struct{}{}:
+				case <-ctx.Done():
+					mutErr <- ctx.Err()
+					return
+				}
+			}
+			if done%25 == 0 {
+				time.Sleep(time.Millisecond)
 			}
 		}
 		mutErr <- nil
 	}()
 
-	// Let chaos run for a bounded time.
-	select {
-	case <-time.After(15 * time.Second):
-	case err := <-mutErr:
-		if err != nil {
-			t.Fatalf("mutation error: %v", err)
-		}
-	}
-	stopMutations()
-
-	// Wait for mutation goroutine to finish.
+	// Wait for the fixed workload, then put a unique marker after it in source
+	// commit order. Observing the destination checkpoint beyond this barrier is
+	// a precise convergence boundary; Kafka end offset alone could move later.
 	if err := <-mutErr; err != nil {
 		t.Fatalf("mutation error: %v", err)
+	}
+	brokerEnd, err := kafka.EndOffset(ctx, itest.KafkaBrokers(), itest.KafkaTopic())
+	if err != nil {
+		t.Fatalf("read Kafka end before final barrier: %v", err)
+	}
+	markers := marker.NewStore(itest.SourceDSN())
+	barrierID, err := markers.WriteBarrier(ctx, jobCfg.JobID, "chaos-final-barrier")
+	if err != nil {
+		t.Fatalf("write final source barrier: %v", err)
+	}
+	barrierCtx, cancelBarrier := context.WithTimeout(ctx, 60*time.Second)
+	barrierOffset, err := kafka.WaitForBarrier(barrierCtx, itest.KafkaBrokers(), itest.KafkaTopic(), barrierID, brokerEnd, func(data []byte) (model.Change, error) {
+		var codec capture.JSONCodec
+		return codec.Decode(data)
+	})
+	cancelBarrier()
+	if err != nil {
+		t.Fatalf("wait for final source barrier in Kafka: %v", err)
 	}
 
 	// Wait for reconciler to catch up to final source state.
@@ -275,34 +303,46 @@ func TestChaos_CrashRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("source check conn: %v", err)
 	}
-	defer srcCheck.Close(context.Background())
+	itest.CloseOnCleanup(t, "source check connection", srcCheck)
 
 	dst, err := itest.DestConn(ctx)
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
 	}
-	defer dst.Close(context.Background())
+	itest.CloseOnCleanup(t, "destination connection", dst)
 
 	var sourceCount, destCount int
 	converged := false
-	for i := 0; i < 120 && !converged; i++ {
+	catchupDeadline := time.Now().Add(90 * time.Second)
+	for !converged && time.Now().Before(catchupDeadline) {
 		if err := srcCheck.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&sourceCount); err != nil {
 			t.Fatalf("count source: %v", err)
 		}
 		if err := dst.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&destCount); err != nil {
 			t.Fatalf("count dest: %v", err)
 		}
-		if sourceCount != destCount {
-			time.Sleep(500 * time.Millisecond)
-			continue
+		latest, err := cpStore.LoadCheckpoint(ctx, jobCfg.JobID)
+		if err != nil {
+			t.Fatalf("load checkpoint during catch-up: %v", err)
 		}
-		// Counts match: verify the full contents match exactly. The scan cursor
-		// may legitimately stop below the initial upper bound when upper-bound
-		// rows were deleted during the chaos window.
-		if err := verifyExact(ctx); err == nil {
+		if latest != nil && latest.CompletedThrough >= latest.ScanUpperBound && latest.NextKafkaOffset >= barrierOffset && sourceCount == destCount {
+			if err := verifyExact(ctx); err == nil {
+				converged = true
+			}
+		}
+		if converged {
 			converged = true
-		} else {
-			time.Sleep(500 * time.Millisecond)
+			break
+		}
+		select {
+		case recErr := <-recErrCh:
+			if recErr != nil {
+				t.Fatalf("reconciler exited during catch-up: %v", recErr)
+			}
+			t.Fatal("reconciler loop exited before catch-up")
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
 	}
 	if !converged {
@@ -317,8 +357,8 @@ func TestChaos_CrashRestart(t *testing.T) {
 			}
 		default:
 		}
-		t.Fatalf("catch-up failed: source=%d dest=%d completed_through=%d next_offset=%d applied_txs=%d",
-			sourceCount, destCount, completed, nextOffset, applied)
+		t.Fatalf("catch-up failed: seed=%d mutations=%d source=%d dest=%d completed_through=%d next_offset=%d barrier_offset=%d applied_txs=%d",
+			mutationSeed, mutationCount, sourceCount, destCount, completed, nextOffset, barrierOffset, applied)
 	}
 
 	// Stop reconciler loop gracefully.
@@ -337,7 +377,7 @@ func TestChaos_CrashRestart(t *testing.T) {
 		t.Fatalf("final verification failed: %v", err)
 	}
 
-	t.Logf("chaos test passed: source rows=%d dest rows=%d", sourceCount, destCount)
+	t.Logf("chaos test passed: seed=%d mutations=%d source rows=%d dest rows=%d barrier=%d", mutationSeed, mutationCount, sourceCount, destCount, barrierOffset)
 }
 
 func verifyExact(ctx context.Context) error {

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"example.com/seam/integration/itest"
 	"example.com/seam/internal/capture"
 	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/failpoint"
@@ -18,7 +19,6 @@ import (
 	"example.com/seam/internal/reconcile"
 	"example.com/seam/internal/scan"
 	"example.com/seam/internal/sink"
-	"example.com/seam/integration/itest"
 )
 
 // TestPhase9_CDCContinuity proves that live changes after the backfill are
@@ -80,7 +80,7 @@ func TestPhase9_CDCContinuity(t *testing.T) {
 	}()
 
 	jobCfg := model.JobConfig{
-		JobID:             "phase9",
+		JobID:             itest.JobID("phase9"),
 		SourceDSN:         itest.SourceDSN(),
 		SourceReplDSN:     itest.SourceReplDSN(),
 		SourceSlot:        "seam_itest_slot",
@@ -94,11 +94,19 @@ func TestPhase9_CDCContinuity(t *testing.T) {
 	if err := cpStore.EnsureTables(ctx); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
-	upperBound, err := scan.NewChunkReader(itest.SourceDSN()).UpperBound(ctx)
+	chunkReader, err := scan.NewChunkReader(ctx, itest.SourceDSN())
+	if err != nil {
+		t.Fatalf("chunk reader: %v", err)
+	}
+	upperBound, err := chunkReader.UpperBound(ctx)
 	if err != nil {
 		t.Fatalf("upper bound: %v", err)
 	}
-	cp, err := cpStore.CreateJob(ctx, jobCfg, upperBound)
+	mutator, err := sink.NewMutatorFor("accounts", chunkReader.Schema())
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	cp, err := cpStore.CreateJob(ctx, jobCfg, chunkReader.Schema(), upperBound)
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
@@ -119,8 +127,9 @@ func TestPhase9_CDCContinuity(t *testing.T) {
 		Consumer:        consumer,
 		CheckpointStore: cpStore,
 		MarkerStore:     marker.NewStore(itest.SourceDSN()),
-		Scanner:         scan.NewChunkReader(itest.SourceDSN()),
-		Sink:            sink.NewMutator(),
+		Scanner:         chunkReader,
+		Sink:            mutator,
+		SourceSchema:    chunkReader.Schema(),
 		Failpoints:      fp,
 	})
 
@@ -133,7 +142,7 @@ func TestPhase9_CDCContinuity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
 	}
-	defer dst.Close(context.Background())
+	itest.CloseOnCleanup(t, "destination connection", dst)
 
 	var completed int64
 	for i := 0; i < 60; i++ {

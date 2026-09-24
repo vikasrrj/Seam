@@ -1,0 +1,3 @@
+rows	workers	chunk_size	owner_bytes	ns_per_op	mib_per_s	discovery_ms	reconciliation_ms	rows_per_s	benchmark
+100000	1	1000	16	29594481480	0.1031	2068	27423	3379	BenchmarkBackfillConfigured-14
+100000	4	1000	16	14887259543	0.2050	2232	12542	6717	BenchmarkBackfillConfigured-14

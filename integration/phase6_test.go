@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"example.com/seam/integration/itest"
 	"example.com/seam/internal/capture"
 	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/kafka"
@@ -18,7 +19,6 @@ import (
 	"example.com/seam/internal/reconcile"
 	"example.com/seam/internal/scan"
 	"example.com/seam/internal/sink"
-	"example.com/seam/integration/itest"
 )
 
 // TestPhase6_HardCases exercises edge cases in reconciliation.
@@ -99,7 +99,7 @@ func TestPhase6_HardCases(t *testing.T) {
 	}()
 
 	jobCfg := model.JobConfig{
-		JobID:             "phase6",
+		JobID:             itest.JobID("phase6"),
 		SourceDSN:         itest.SourceDSN(),
 		SourceReplDSN:     itest.SourceReplDSN(),
 		SourceSlot:        "seam_itest_slot",
@@ -113,11 +113,19 @@ func TestPhase6_HardCases(t *testing.T) {
 	if err := cpStore.EnsureTables(ctx); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
-	upperBound, err := scan.NewChunkReader(itest.SourceDSN()).UpperBound(ctx)
+	chunkReader, err := scan.NewChunkReader(ctx, itest.SourceDSN())
+	if err != nil {
+		t.Fatalf("chunk reader: %v", err)
+	}
+	upperBound, err := chunkReader.UpperBound(ctx)
 	if err != nil {
 		t.Fatalf("upper bound: %v", err)
 	}
-	cp, err := cpStore.CreateJob(ctx, jobCfg, upperBound)
+	mutator, err := sink.NewMutatorFor("accounts", chunkReader.Schema())
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	cp, err := cpStore.CreateJob(ctx, jobCfg, chunkReader.Schema(), upperBound)
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
@@ -137,8 +145,9 @@ func TestPhase6_HardCases(t *testing.T) {
 		Consumer:        consumer,
 		CheckpointStore: cpStore,
 		MarkerStore:     marker.NewStore(itest.SourceDSN()),
-		Scanner:         scan.NewChunkReader(itest.SourceDSN()),
-		Sink:            sink.NewMutator(),
+		Scanner:         chunkReader,
+		Sink:            mutator,
+		SourceSchema:    chunkReader.Schema(),
 	})
 
 	recCtx, recCancel := context.WithCancel(ctx)
@@ -187,7 +196,7 @@ func TestPhase6_HardCases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
 	}
-	defer dst.Close(context.Background())
+	itest.CloseOnCleanup(t, "destination connection", dst)
 
 	var completed int64 = -1
 	for i := 0; i < 120; i++ {
@@ -212,21 +221,21 @@ func TestPhase6_HardCases(t *testing.T) {
 		balance int64
 		exists  bool
 	}{
-		-10:                               {"neg-ten", -1000, true},
-		-5:                                {"neg-five", -500, true},
-		0:                                 {"zero", 0, true},
-		1:                                 {"one-updated", 100, true},
-		2:                                 {"", 0, false},
-		3:                                 {"three-reborn", 3000, true},
-		4:                                 {"four", 400, true},
-		5:                                 {"five-second", 500, true},
-		6:                                 {"six", 600, true},
-		7:                                 {"seven", 700, true},
-		8:                                 {"eight", 800, true},
-		9:                                 {"nine", 900, true},
-		10:                                {"ten", 1000, true},
-		100:                               {"beyond-bound", 10000, true},
-		math.MaxInt64 - 1:                 {"max-minus-one", math.MaxInt64 - 1, true},
+		-10:               {"neg-ten", -1000, true},
+		-5:                {"neg-five", -500, true},
+		0:                 {"zero", 0, true},
+		1:                 {"one-updated", 100, true},
+		2:                 {"", 0, false},
+		3:                 {"three-reborn", 3000, true},
+		4:                 {"four", 400, true},
+		5:                 {"five-second", 500, true},
+		6:                 {"six", 600, true},
+		7:                 {"seven", 700, true},
+		8:                 {"eight", 800, true},
+		9:                 {"nine", 900, true},
+		10:                {"ten", 1000, true},
+		100:               {"beyond-bound", 10000, true},
+		math.MaxInt64 - 1: {"max-minus-one", math.MaxInt64 - 1, true},
 	}
 
 	for id, exp := range expected {

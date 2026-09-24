@@ -21,13 +21,17 @@ stale snapshot.
   dependencies (`consumer`, `checkpointStore`, `chunkStore`, `markerStore`,
   `scanner`, `sink`) so unit tests can use fakes.
 - `internal/checkpoint` owns destination metadata tables (`seam_jobs`,
-  `seam_checkpoints`, `seam_applied_txs`, `seam_chunks`).
+  `seam_checkpoints`, `seam_applied_txs`, `seam_chunks`, `seam_candidates`,
+  `seam_route_fence`, `seam_cutover_gates`, `seam_promotions`). `Store.Begin` takes a shared routing lock before a
+  writer resolves a destination table name.
 - `internal/model` contains shared data types including `Chunk`, `ChunkState`,
   `Checkpoint`, and `JobConfig`.
 - `cmd/seam` is the reconciler/worker process. It now discovers chunks and
   passes a `ChunkStore` to the reconciler when running with durable state.
 - `cmd/seam-capture` streams `pgoutput` to Kafka.
 - `cmd/seam-lab` is the verifier/debug tool.
+- `internal/promotion` and `cmd/seam-promote` own the narrow PostgreSQL
+  source-write fence, exact shadow comparison, and atomic name swap.
 
 ## Key correctness properties to preserve
 
@@ -41,11 +45,34 @@ stale snapshot.
    are ignored after recovery bumps the attempt.
 5. **Atomic chunk completion.** Chunk state, checkpoint, and survivors are
    updated in the same destination transaction.
+6. **Complete source transactions.** Capture publishes one committed source
+   transaction as one envelope or ordered bounded fragments. Open transactions
+   spill to disk; consumers expose a replayable transaction only after `Final`
+   and apply one bounded fragment at a time inside one destination transaction. Unsupported
+   `pgoutput` and the hard event cap stop without acknowledging source WAL.
+7. **No partial manifest.** Durable discovery advances the cursor and inserts
+   its next logical range together. A sealed manifest covers every `BIGINT`
+   key through the captured upper bound.
+8. **Promotion fence.** Every SEAM destination writer acquires the shared
+   route lock before naming a physical table. Promotion takes it exclusively,
+   validates the shadow under table locks, and atomically renames tables.
+9. **Process leadership.** Every production reconciler owns a leased monotonic
+   epoch. Expired owners cannot mutate destination rows, checkpoints, chunks,
+   discovery, or recovery state, even if their goroutines continue running.
+10. **Capture leadership.** One source advisory-lock owner holds the slot term;
+    every takeover advances a durable epoch and must preserve source,
+    generation, publication, and topic identity.
+11. **Exact-prefix promotion.** Durable gates stop live and shadow at the same
+    transaction boundary. Full validation uses an MVCC source snapshot after
+    writes resume; the final fence validates only changed keys before swap.
+12. **Shared load admission.** Source scans and destination transactions take
+    PostgreSQL session advisory-lock permits, so live and shadow processes
+    share configured capacity and crashed owners release their slots.
 
 ## When modifying code
 
-- Keep changes minimal and focused on one phase at a time.
-- Add or update unit tests in the same package; use fakes, not a live database.
+- Keep changes focused on a stated invariant; preserve failure behavior and
+  test it with deterministic fakes or a disposable integration database.
 - If you change a metadata table schema, update `checkpoint.EnsureTables` and
   any load/save methods.
 - If you add configuration, expose it via environment variable in
@@ -54,9 +81,19 @@ stale snapshot.
 
 ## Current status
 
-- Phase 1 (backfill correctness), Phase 2 (durable chunk state), Phase 3 (crash
-  recovery), Phase 4 (atomic chunk completion), Phase 5 (bounded memory),
-  Phase 6 (scalable scanning), Phase 7 (adaptive chunking), and Phase 8
-  (parallel workers: coordinator + worker pool, `SEAM_WORKERS`, chunk-ordered
-  commits, pending-eviction sets) are implemented and covered by unit tests.
-- Remaining phases are listed in `README.md` under Roadmap.
+- Unit tests, core race tests, build, vet, and integration-test compilation
+  pass. This does not establish end-to-end correctness.
+- Production `cmd/seam` rejects adaptive chunking and source table/key values
+  other than `accounts/id`. The older adaptive and legacy test paths are not
+  evidence for the production coordinator.
+- Online shadow promotion, exact cutover gates, and capture leadership have passed live integration runs against this
+  workspace's dedicated PostgreSQL/Kafka stack (`TestOnlineShadowResync`,
+  `TestAtomicPromotionAndIdempotentRetry`). The latest exact-content-verified
+  corrected post-change smoke pair, now wired through production resource
+  admission, measured 3.09 s with one worker and 1.44 s with four workers
+  (2.15x). It is not a distribution. Earlier post-change smoke pairs bypassed
+  the resource controller; the older counterbalanced in-memory-window run is
+  historical evidence only. See `docs/benchmarks.md`. Results are reported
+  only for executed workloads and are not extrapolated to 10M/100M-row scale.
+- See `README.md` and `docs/operations.md` for the supported run sequence and
+  explicit limitations.

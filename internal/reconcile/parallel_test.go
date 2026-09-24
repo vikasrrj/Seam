@@ -57,8 +57,11 @@ type safeCheckpointStore struct {
 }
 
 func (s *safeCheckpointStore) Begin(ctx context.Context) (pgx.Tx, error) { return &fakeTx{}, nil }
+func (s *safeCheckpointStore) AssertLeadership(context.Context, pgx.Tx, *model.Checkpoint) error {
+	return nil
+}
 
-func (s *safeCheckpointStore) UpdateCheckpoint(ctx context.Context, tx pgx.Tx, cp *model.Checkpoint) error {
+func (s *safeCheckpointStore) UpdateCheckpoint(ctx context.Context, tx pgx.Tx, cp *model.Checkpoint, expectedOffset int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	clone := *cp
@@ -71,6 +74,17 @@ func (s *safeCheckpointStore) MarkApplied(ctx context.Context, tx pgx.Tx, jobID,
 	defer s.mu.Unlock()
 	s.applied = append(s.applied, model.SourceTx{Generation: generation, LSN: lsn, XID: xid})
 	return nil
+}
+
+func (s *safeCheckpointStore) IsApplied(ctx context.Context, tx pgx.Tx, jobID, generation, lsn string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, applied := range s.applied {
+		if applied.Generation == generation && applied.LSN == lsn {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *safeCheckpointStore) snapshot() []*model.Checkpoint {
@@ -125,7 +139,7 @@ func (g *gateScanner) UpperBound(ctx context.Context) (int64, error) { return g.
 func (g *gateScanner) NextChunk(ctx context.Context, completedThrough, upperBound int64, chunkSize int) (model.ChunkRange, bool, error) {
 	return g.inner.NextChunk(ctx, completedThrough, upperBound, chunkSize)
 }
-func (g *gateScanner) ReadChunk(ctx context.Context, minID, maxID int64) ([]model.Account, error) {
+func (g *gateScanner) ReadChunk(ctx context.Context, minID, maxID int64) ([]model.Row, error) {
 	g.mu.Lock()
 	ch, ok := g.gates[gateKey(minID, maxID)]
 	g.mu.Unlock()
@@ -142,7 +156,7 @@ func (g *gateScanner) ReadChunk(ctx context.Context, minID, maxID int64) ([]mode
 // errScanner fails ReadChunk for a specific range, simulating a scan failure
 // on one worker's chunk.
 type errScanner struct {
-	inner  *fakeScanner
+	inner   *fakeScanner
 	failMin int64
 }
 
@@ -150,7 +164,7 @@ func (s *errScanner) UpperBound(ctx context.Context) (int64, error) { return s.i
 func (s *errScanner) NextChunk(ctx context.Context, completedThrough, upperBound int64, chunkSize int) (model.ChunkRange, bool, error) {
 	return s.inner.NextChunk(ctx, completedThrough, upperBound, chunkSize)
 }
-func (s *errScanner) ReadChunk(ctx context.Context, minID, maxID int64) ([]model.Account, error) {
+func (s *errScanner) ReadChunk(ctx context.Context, minID, maxID int64) ([]model.Row, error) {
 	if minID == s.failMin {
 		return nil, errors.New("injected read chunk failure")
 	}
@@ -172,9 +186,9 @@ func seedPendingChunk(cs *fakeChunkStore, jobID, attempt string, min, max int64)
 // parallelConfig builds a Config wired for parallel mode: a durable chunk
 // store seeded with the given ranges, the given scanner, and a channel
 // consumer the test controls.
-func parallelConfig(rows map[int64]model.Account, chunks [][2]int64, workers int, scanner scanner, consumer *chanConsumer) (Config, *fakeChunkStore, *fakeSink, *fakeMarkerStore, *safeCheckpointStore) {
+func parallelConfig(rows map[int64]model.Row, chunks [][2]int64, workers int, scanner scanner, consumer *chanConsumer) (Config, *fakeChunkStore, *fakeSink, *fakeMarkerStore, *safeCheckpointStore) {
 	if rows == nil {
-		rows = map[int64]model.Account{}
+		rows = map[int64]model.Row{}
 	}
 	var maxID int64 = math.MinInt64
 	var minID int64 = math.MaxInt64
@@ -230,6 +244,7 @@ func parallelConfig(rows map[int64]model.Account, chunks [][2]int64, workers int
 		MarkerStore:     marker,
 		Scanner:         scanner,
 		Sink:            sink,
+		SourceSchema:    testSourceSchema(),
 		Metrics:         nil,
 	}
 	return cfg, chunkStore, sink, marker, cpStore
@@ -310,19 +325,134 @@ func firstCompletedThroughIndex(cps []*model.Checkpoint, target int64) int {
 
 // ---------- tests ----------
 
+func TestParallel_DuplicateLowMarkerAtNewOffset(t *testing.T) {
+	rows := map[int64]model.Row{1: account(1, "one", 10)}
+	consumer := newChanConsumer()
+	cfg, chunkStore, _, markerStore, _ := parallelConfig(rows,
+		[][2]int64{{1, 1}}, 2, &fakeScanner{upperBound: 1, rows: rows}, consumer)
+	runCh := runParallelAsync(t, cfg, 5*time.Second)
+	waitFor(t, 2*time.Second, "LOW marker", func() bool { return lowMarkerCount(markerStore) == 1 })
+	low := lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 1})
+	low.Source.LSN = "lsn-duplicate-low"
+	consumer.push([]kafka.Record{
+		rec(0, low),
+		rec(1, low),
+		rec(2, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 1})),
+	})
+	waitFor(t, 2*time.Second, "chunk completion after duplicate marker", func() bool { return completedChunks(chunkStore) == 1 })
+	consumer.finish()
+	if err := awaitRun(t, runCh, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParallel_SparseFirstRangeCompletes(t *testing.T) {
+	rows := map[int64]model.Row{10: account(10, "ten", 10)}
+	consumer := newChanConsumer()
+	cfg, chunkStore, _, markerStore, cpStore := parallelConfig(rows,
+		[][2]int64{{10, 10}}, 2, &fakeScanner{upperBound: 10, rows: rows}, consumer)
+	runCh := runParallelAsync(t, cfg, 5*time.Second)
+	waitFor(t, 2*time.Second, "LOW marker", func() bool { return lowMarkerCount(markerStore) == 1 })
+	consumer.push([]kafka.Record{
+		rec(0, lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 10, Max: 10})),
+		rec(1, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 10, Max: 10})),
+	})
+	waitFor(t, 2*time.Second, "sparse chunk completion", func() bool { return completedChunks(chunkStore) == 1 })
+	consumer.finish()
+	if err := awaitRun(t, runCh, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if cpStore.latest().CompletedThrough != 10 {
+		t.Fatalf("sparse frontier did not advance: %+v", cpStore.latest())
+	}
+}
+
+func TestParallel_DoesNotApplyAfterHighBeforeCandidates(t *testing.T) {
+	rows := map[int64]model.Row{1: account(1, "old", 10)}
+	scanner := newGateScanner(&fakeScanner{upperBound: 1, rows: rows})
+	scanner.gate(1, 1)
+	consumer := newChanConsumer()
+	cfg, chunkStore, sink, markerStore, cpStore := parallelConfig(rows,
+		[][2]int64{{1, 1}}, 2, scanner, consumer)
+	runCh := runParallelAsync(t, cfg, 5*time.Second)
+	waitFor(t, 2*time.Second, "LOW marker", func() bool { return lowMarkerCount(markerStore) == 1 })
+	consumer.push([]kafka.Record{
+		rec(0, lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 1})),
+		rec(1, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 1})),
+		rec(2, accChange(model.OpUpdate, 1, "new", 20)),
+	})
+	select {
+	case err := <-runCh:
+		t.Fatalf("run ended before scan completed: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	if len(sink.changes()) != 0 {
+		t.Fatal("post-HIGH CDC reached destination before snapshot finalization")
+	}
+	scanner.open(1, 1)
+	waitFor(t, 2*time.Second, "chunk completion", func() bool { return completedChunks(chunkStore) == 1 })
+	waitFor(t, 2*time.Second, "later CDC", func() bool { return len(sink.changes()) == 1 })
+	consumer.finish()
+	if err := awaitRun(t, runCh, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if cpStore.latest().NextKafkaOffset != 3 || rowOwner(sink.changes()[0].Row) != "new" {
+		t.Fatalf("later CDC was not applied after HIGH: cp=%+v changes=%+v", cpStore.latest(), sink.changes())
+	}
+}
+
+func TestParallel_HigherRangeHighBeforeLowerRange(t *testing.T) {
+	rows := map[int64]model.Row{
+		1: account(1, "one", 1), 2: account(2, "two", 2),
+		10: account(10, "ten", 10), 11: account(11, "eleven", 11),
+	}
+	scanner := newGateScanner(&fakeScanner{upperBound: 11, rows: rows})
+	scanner.gate(1, 2)
+	consumer := newChanConsumer()
+	cfg, chunkStore, _, markerStore, cpStore := parallelConfig(rows,
+		[][2]int64{{1, 2}, {10, 11}}, 2, scanner, consumer)
+	runCh := runParallelAsync(t, cfg, 5*time.Second)
+	waitFor(t, 2*time.Second, "two LOW markers", func() bool { return lowMarkerCount(markerStore) == 2 })
+	lowA := lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 2})
+	lowB := lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 10, Max: 11})
+	highB := highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 10, Max: 11})
+	highA := highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 2})
+	lowA.Source.LSN, lowB.Source.LSN = "lsn-low-a", "lsn-low-b"
+	highB.Source.LSN, highA.Source.LSN = "lsn-high-b", "lsn-high-a"
+	consumer.push([]kafka.Record{
+		rec(0, lowA),
+		rec(1, lowB),
+		rec(2, highB),
+		rec(3, highA),
+	})
+	waitFor(t, 2*time.Second, "higher range finalized", func() bool { return completedChunks(chunkStore) == 1 })
+	if cpStore.latest().CompletedThrough != 0 {
+		t.Fatalf("frontier jumped over unfinished range: %+v", cpStore.latest())
+	}
+	scanner.open(1, 2)
+	waitFor(t, 2*time.Second, "both ranges finalized", func() bool { return completedChunks(chunkStore) == 2 })
+	consumer.finish()
+	if err := awaitRun(t, runCh, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if cpStore.latest().CompletedThrough != 11 || cpStore.latest().NextKafkaOffset != 4 {
+		t.Fatalf("frontier did not advance across sparse ranges: %+v", cpStore.latest())
+	}
+}
+
 // TestParallel_TwoWorkersCompleteBackfill proves two workers reconcile two
 // chunks against one shared stream: survivors are written, chunks complete,
 // the checkpoint advances, and in-window evictions that arrive before the
 // snapshot (workers gated behind the scan) are never lost.
 func TestParallel_TwoWorkersCompleteBackfill(t *testing.T) {
-	rows := map[int64]model.Account{
+	rows := map[int64]model.Row{
 		1: account(1, "one", 100),
 		2: account(2, "two", 200),
 		3: account(3, "three", 300),
 		4: account(4, "four", 400),
 	}
 	scanner := newGateScanner(&fakeScanner{upperBound: 4, rows: rows})
-	// Gate both chunks so the stream can be fully consumed before delivery.
+	// Gate both scans so HIGH cannot finalize before delivery.
 	scanner.gate(1, 2)
 	scanner.gate(3, 4)
 
@@ -347,16 +477,15 @@ func TestParallel_TwoWorkersCompleteBackfill(t *testing.T) {
 		rec(6, accChange(model.OpUpdate, 7, "seven-new", 700)),
 	})
 
-	// Wait until the coordinator applied the whole stream (the tail record is a
-	// plain CDC change, applied only after every in-window record above it), so
-	// all evictions are recorded before the scan gates open.
-	waitFor(t, 5*time.Second, "stream consumed", func() bool { return len(sink.changes()) == 3 })
+	// The stream reaches HIGH and must stop before the later CDC event.
+	waitFor(t, 5*time.Second, "in-window update", func() bool { return len(sink.changes()) == 1 })
 
 	// Release the scans; deliveries must apply the pre-recorded evictions.
 	scanner.open(1, 2)
 	scanner.open(3, 4)
 
 	waitFor(t, 5*time.Second, "chunks completed", func() bool { return completedChunks(chunkStore) == 2 })
+	waitFor(t, 5*time.Second, "stream consumed", func() bool { return len(sink.changes()) == 3 })
 	consumer.finish()
 
 	if err := awaitRun(t, runCh, 10*time.Second); err != nil {
@@ -402,7 +531,7 @@ func TestParallel_TwoWorkersCompleteBackfill(t *testing.T) {
 // before chunk A while chunk A is the next-in-order commit. The commit gate
 // must hold B until A commits so completed_through never jumps ahead.
 func TestParallel_OutOfOrderScansCommitInOrder(t *testing.T) {
-	rows := map[int64]model.Account{
+	rows := map[int64]model.Row{
 		1: account(1, "one", 100),
 		2: account(2, "two", 200),
 		3: account(3, "three", 300),
@@ -423,12 +552,9 @@ func TestParallel_OutOfOrderScansCommitInOrder(t *testing.T) {
 		rec(1, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 1, Max: 2})),
 		rec(2, lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 3, Max: 4})),
 		rec(3, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 3, Max: 4})),
-		// Tail CDC record: applied only after every earlier group is processed,
-		// so its arrival proves the whole stream was consumed.
+		// Tail CDC must wait until the earlier HIGH has finalized.
 		rec(4, accChange(model.OpUpdate, 9, "nine", 900)),
 	})
-	waitFor(t, 5*time.Second, "stream consumed", func() bool { return len(sink.changes()) == 1 })
-
 	// B's worker delivered already; A is still gated. Nothing may commit yet
 	// because A is next in order.
 	if completedChunks(chunkStore) != 0 {
@@ -437,6 +563,7 @@ func TestParallel_OutOfOrderScansCommitInOrder(t *testing.T) {
 
 	scanner.open(1, 2)
 	waitFor(t, 5*time.Second, "chunks completed", func() bool { return completedChunks(chunkStore) == 2 })
+	waitFor(t, 5*time.Second, "stream consumed", func() bool { return len(sink.changes()) == 1 })
 	consumer.finish()
 
 	if err := awaitRun(t, runCh, 10*time.Second); err != nil {
@@ -464,7 +591,7 @@ func TestParallel_OutOfOrderScansCommitInOrder(t *testing.T) {
 // one chunk: with three chunks and two workers, the faster worker picks up the
 // third range after finishing its first, and completion stays in order.
 func TestParallel_WorkerReusesPoolChannel(t *testing.T) {
-	rows := map[int64]model.Account{
+	rows := map[int64]model.Row{
 		1: account(1, "one", 100),
 		2: account(2, "two", 200),
 		3: account(3, "three", 300),
@@ -492,18 +619,17 @@ func TestParallel_WorkerReusesPoolChannel(t *testing.T) {
 		rec(3, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 3, Max: 4})),
 		rec(4, accChange(model.OpUpdate, 9, "nine", 900)),
 	})
-	waitFor(t, 5*time.Second, "segment 1 consumed", func() bool { return len(sink.changes()) == 1 })
-
 	// Release A: A commits (next in order) then B drains.
 	scanner.open(1, 2)
 	waitFor(t, 5*time.Second, "chunks A and B completed",
 		func() bool { return completedChunks(chunkStore) == 2 && lowMarkerCount(markerStore) >= 3 })
+	waitFor(t, 5*time.Second, "segment 1 consumed", func() bool { return len(sink.changes()) == 1 })
 
 	// The freed worker leased chunk C and wrote its LOW marker; now stream its
 	// segment and wait for the commit.
 	consumer.push([]kafka.Record{
-		rec(4, lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 5, Max: 6})),
-		rec(5, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 5, Max: 6})),
+		rec(5, lowMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 5, Max: 6})),
+		rec(6, highMarker("test-job", "gen:0:attempt:0", model.ChunkRange{Min: 5, Max: 6})),
 	})
 	waitFor(t, 5*time.Second, "chunk C completed", func() bool { return completedChunks(chunkStore) == 3 })
 	consumer.finish()
@@ -524,7 +650,7 @@ func TestParallel_WorkerReusesPoolChannel(t *testing.T) {
 // aborts the run instead of stalling forever waiting for a window that can
 // never complete.
 func TestParallel_WorkerFailureFailsRun(t *testing.T) {
-	rows := map[int64]model.Account{
+	rows := map[int64]model.Row{
 		1: account(1, "one", 100),
 		2: account(2, "two", 200),
 		3: account(3, "three", 300),
