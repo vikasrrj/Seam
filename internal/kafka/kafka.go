@@ -87,7 +87,11 @@ func NewConsumer(brokers []string, topic string, startOffset int64, decode Decod
 		kgo.FetchMaxBytes(4 << 20),
 		kgo.FetchMaxPartitionBytes(maxEnvelopeBytes),
 	}
-	optsKgo = append(optsKgo, transport.KafkaOptions()...)
+	transportOptions, err := transport.KafkaOptions()
+	if err != nil {
+		return nil, err
+	}
+	optsKgo = append(optsKgo, transportOptions...)
 	client, err := kgo.NewClient(optsKgo...)
 	if err != nil {
 		return nil, fmt.Errorf("create kafka consumer: %w", err)
@@ -448,7 +452,11 @@ func (c *Consumer) Close() {
 // ordering contract. A reused name with a new ID is a retention gap, even if
 // offsets happen to look plausible.
 func TopicIdentity(ctx context.Context, brokers []string, topic string) (string, error) {
-	client, err := kgo.NewClient(append([]kgo.Opt{kgo.SeedBrokers(brokers...)}, transport.KafkaOptions()...)...)
+	transportOptions, err := transport.KafkaOptions()
+	if err != nil {
+		return "", err
+	}
+	client, err := kgo.NewClient(append([]kgo.Opt{kgo.SeedBrokers(brokers...)}, transportOptions...)...)
 	if err != nil {
 		return "", err
 	}
@@ -496,9 +504,13 @@ func EndOffset(ctx context.Context, brokers []string, topic string) (int64, erro
 }
 
 func topicOffset(ctx context.Context, brokers []string, topic string, end bool) (int64, error) {
+	transportOptions, err := transport.KafkaOptions()
+	if err != nil {
+		return 0, err
+	}
 	client, err := kgo.NewClient(append([]kgo.Opt{
 		kgo.SeedBrokers(brokers...),
-	}, transport.KafkaOptions()...)...)
+	}, transportOptions...)...)
 	if err != nil {
 		return 0, fmt.Errorf("create kafka client: %w", err)
 	}

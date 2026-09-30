@@ -8,6 +8,7 @@ import (
 
 	"example.com/seam/internal/model"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // KeyFromRow extracts the int64 message primary key from a positional row.
@@ -98,15 +99,62 @@ func (s *Schema) TableQualified() string {
 // are parsed into typed int64 values; every other column stays in its exact
 // canonical text form.
 func (s *Schema) ScanRows(ctx context.Context, conn *pgx.Conn, minID, maxID int64) ([]model.Row, error) {
+	return s.ScanRowsFrom(ctx, conn, minID, maxID)
+}
+
+type RowQuerier interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+// ScanRowsFrom is ScanRows over an existing connection or transaction. It is
+// used by promotion validation to keep every range read on one imported MVCC
+// snapshot after the short source-write fence has been released.
+func (s *Schema) ScanRowsFrom(ctx context.Context, conn RowQuerier, minID, maxID int64) ([]model.Row, error) {
 	if _, err := conn.Exec(ctx, "SET TIME ZONE 'UTC'"); err != nil {
 		return nil, fmt.Errorf("set UTC session for canonical scan: %w", err)
 	}
 	key := s.PKColumn().Name
-	query := fmt.Sprintf(`SELECT %s FROM %s WHERE %s >= $1 AND %s <= $2 ORDER BY %s`,
+	// Qualify the sort key. PostgreSQL otherwise resolves ORDER BY id to the
+	// projected (id)::text output label, producing 1,10,11,... instead of
+	// numeric primary-key order and invalidating ordered exact comparisons.
+	query := fmt.Sprintf(`SELECT %s FROM %s AS seam_source WHERE seam_source.%s >= $1 AND seam_source.%s <= $2 ORDER BY seam_source.%s`,
 		s.CanonicalScanList(), s.TableQualified(), key, key, key)
 	rows, err := conn.Query(ctx, query, minID, maxID)
 	if err != nil {
 		return nil, fmt.Errorf("scan %s [%d,%d]: %w", s.TableQualified(), minID, maxID, err)
+	}
+	defer rows.Close()
+	var result []model.Row
+	for rows.Next() {
+		row, err := s.scanRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ScanKeysFrom reads a bounded set of primary keys on an existing snapshot.
+// Missing rows are intentionally omitted so callers can compare deletes as
+// well as inserts and updates against a destination at the same stream prefix.
+func (s *Schema) ScanKeysFrom(ctx context.Context, conn RowQuerier, keys []int64) ([]model.Row, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	if _, err := conn.Exec(ctx, "SET TIME ZONE 'UTC'"); err != nil {
+		return nil, fmt.Errorf("set UTC session for canonical scan: %w", err)
+	}
+	key := s.PKColumn().Name
+	query := fmt.Sprintf(`SELECT %s FROM %s AS seam_source WHERE seam_source.%s = ANY($1::bigint[]) ORDER BY seam_source.%s`,
+		s.CanonicalScanList(), s.TableQualified(), key, key)
+	rows, err := conn.Query(ctx, query, keys)
+	if err != nil {
+		return nil, fmt.Errorf("scan %s changed keys: %w", s.TableQualified(), err)
 	}
 	defer rows.Close()
 	var result []model.Row

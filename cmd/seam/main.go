@@ -381,6 +381,11 @@ func (cfg config) validate() error {
 	if err := schema.ValidateIdentifier(cfg.SourceTable); err != nil {
 		return fmt.Errorf("invalid source table: %w", err)
 	}
+	if cfg.SourceKey != "" {
+		if err := schema.ValidateIdentifier(cfg.SourceKey); err != nil {
+			return fmt.Errorf("invalid source key: %w", err)
+		}
+	}
 	if err := schema.ValidateIdentifier(cfg.DestTable); err != nil {
 		return fmt.Errorf("invalid destination table: %w", err)
 	}

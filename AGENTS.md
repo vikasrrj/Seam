@@ -2,10 +2,9 @@
 
 ## Project overview
 
-SEAM is a PostgreSQL → PostgreSQL backfill system that copies tables while live
-CDC continues. It uses LOW/HIGH markers bracketing primary-key chunks so that
-any row changed between markers is replayed from CDC and never overwritten by a
-stale snapshot.
+SEAM is a PostgreSQL CDC and online-backfill system with PostgreSQL and
+Snowflake destination paths. It uses LOW/HIGH markers bracketing primary-key
+chunks so live changes win over stale snapshot candidates.
 
 ## Build and test
 
@@ -68,6 +67,9 @@ stale snapshot.
 12. **Shared load admission.** Source scans and destination transactions take
     PostgreSQL session advisory-lock permits, so live and shadow processes
     share configured capacity and crashed owners release their slots.
+13. **Snowflake sink fencing.** One renewable sink lease owns a monotonic
+    epoch. Every Snowflake apply transaction proves that epoch immediately
+    before ledger/frontier commit; takeover fences an expired process.
 
 ## When modifying code
 
@@ -82,10 +84,10 @@ stale snapshot.
 ## Current status
 
 - Unit tests, core race tests, build, vet, and integration-test compilation
-  pass. This does not establish end-to-end correctness.
-- Production `cmd/seam` rejects adaptive chunking and source table/key values
-  other than `accounts/id`. The older adaptive and legacy test paths are not
-  evidence for the production coordinator.
+  pass. The executed Snowflake E2E scenario establishes the behavior described
+  below for that workload; it does not prove every failure or scale boundary.
+- Production `cmd/seam` rejects adaptive chunking. Source rows are descriptor
+  driven but still require one `BIGINT` primary key and the closed type set.
 - Online shadow promotion, exact cutover gates, and capture leadership have passed live integration runs against this
   workspace's dedicated PostgreSQL/Kafka stack (`TestOnlineShadowResync`,
   `TestAtomicPromotionAndIdempotentRetry`). The latest exact-content-verified
@@ -97,3 +99,8 @@ stale snapshot.
   only for executed workloads and are not extrapolated to 10M/100M-row scale.
 - See `README.md` and `docs/operations.md` for the supported run sequence and
   explicit limitations.
+- The Snowflake path has live control-plane and sink-fencing coverage. The
+  combined PostgreSQL/Kafka/Snowflake crash-recovery test is tagged
+  `integration && snowflake_integration`, requires both external systems, and
+  passed with an exact 520-row match after sink and worker recovery on
+  September 30, 2026 (210.14 s; correctness evidence, not a benchmark).

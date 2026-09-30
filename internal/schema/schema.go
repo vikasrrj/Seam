@@ -205,7 +205,7 @@ func loadFromConn(ctx context.Context, conn Querier, namespace, table string, re
 	}
 
 	rows, err := conn.Query(ctx, `
-		SELECT a.attnum, a.attname::text, t.typname::text, a.atttypid::oid, a.attnotnull
+		SELECT a.attnum, a.attname::text, t.typname::text, a.atttypid::oid, NOT a.attnotnull
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace

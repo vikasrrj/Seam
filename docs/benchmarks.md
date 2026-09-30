@@ -178,3 +178,41 @@ verification, one sample per worker per pass) is the current evidence.
 - **One capture stream for both worker counts.** The 4-worker case consumes
   the same single-partition Kafka topic; capture is not sharded, so 4 workers
   cannot be expected to scale capture-bound phases.
+
+## Snowflake snapshot-staging baseline — September 30, 2026
+
+This benchmark measures only `Store.StageSnapshot`: delete the disposable
+stage for one leased chunk, encode rows, submit parameterized multi-row
+`INSERT ... SELECT ... UNION ALL` batches of at most 500 rows, persist the row
+count, and commit. PostgreSQL scanning, Kafka, LOW/HIGH catch-up, final
+Snowflake `MERGE`, validation, and promotion are outside the timer. It is a
+component measurement, not an end-to-end throughput claim.
+
+Executed command:
+
+```bash
+go test -tags=snowflake_integration -run '^$' \
+  -bench '^BenchmarkLiveSnowflakeStageSnapshot$' \
+  -benchtime=1x -count=1 ./internal/snowflake
+```
+
+One fresh temporary Snowflake schema was used per case and removed afterwards.
+Rows contained a `BIGINT` key and a 96-byte text value.
+
+| Rows | Wall time | Rows/s | Approximate payload MB/s |
+| ---: | ---: | ---: | ---: |
+| 100 | 2.7337 s | 36.58 | below 0.01 |
+| 1,000 | 6.2366 s | 160.3 | 0.02 |
+| 5,000 | 26.5800 s | 188.1 | 0.02 |
+
+The rise from 36.6 to 188.1 rows/s shows fixed request/transaction overhead is
+amortized by larger batches. The plateau near 188 rows/s shows the current
+parameterized row-staging path is the immediate warehouse-side bottleneck for
+this workload. Increasing backfill workers before replacing that path would
+mostly add concurrent SQL and warehouse contention. The justified next
+experiment is immutable staged files plus `PUT`/`COPY INTO` (or an equivalent
+bulk API), followed by the same benchmark and a full source-to-promotion run.
+
+This was one execution per size against the configured account. Warehouse
+size, cache state, network path, and credit consumption were not captured, so
+the absolute values must not be compared with vendor results or extrapolated.

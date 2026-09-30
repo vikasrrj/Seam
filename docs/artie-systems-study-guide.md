@@ -95,26 +95,68 @@ PostgreSQL can issue asynchronous prefetch based on `effective_io_concurrency`; 
 
 Multiple scan workers help only while the device or replica has unused queue depth and bandwidth. With one latency-bound scan, four workers may keep the device busy. Once bandwidth is full, sixteen workers merely divide the same bytes/s while adding PostgreSQL executor work and contention.
 
-### Move bulk work away from the primary
+### This part is saying two things.
 
-**PUBLICLY KNOWN.** Artie's public online-backfill material says historical reads can use a read replica so the primary continues handling production work.
+First: move the heavy backfill reads away from the primary database that customers are using.
 
-**GENERAL HIGH-PERFORMANCE TECHNIQUE.** A replica isolates backfill I/O, cache pollution, query CPU, and connections. It does not create free capacity: the replica still has finite storage and CPU, and replay lag defines how recent its snapshot is. Several replicas can be assigned disjoint tables or chunks if the system has a consistency model that tolerates their different replay positions. Spreading one logical snapshot over replicas without coordinating snapshot time can produce a dataset whose chunks represent different source moments; a live-change reconciliation layer must close that gap.
+So instead of:
 
-Read isolation is often more valuable than raw speed. A backfill that can drive the primary at 2 GB/s but destroys customer p99 latency is a failed optimization. Source-side admission should enforce maximum active scans, maximum I/O or CPU pressure, and optionally a token-bucket byte rate. When production latency rises, the scanner yields even if its own throughput falls.
+Primary Postgres = customer traffic + huge backfill scans
 
-### What proves the storage fix worked
+you do:
 
-Record before and after:
+Primary Postgres = customer traffic
+Read replica = backfill scans
 
-- rows/s and uncompressed bytes/s returned by the query;
-- device MB/s, IOPS, average request size, `await`, and queue depth;
-- `pg_stat_io` reads, read time, evictions, and bulk-read context;
-- `EXPLAIN (ANALYZE, BUFFERS, SERIALIZE)` plan, heap/index blocks, and output serialization time;
-- primary/replica CPU and foreground-query p95/p99 latency;
-- rows and bytes per physical block read.
+That helps because the backfill no longer fights customers for disk I/O, CPU, cache, and database connections.
 
-If rows/s rises, device bandwidth rises, and customer latency stays within budget, parallelism used idle storage capacity. If workers rise while aggregate bytes/s stays flat and latency worsens, storage is saturated. Once storage is no longer limiting, expect PostgreSQL CPU, tuple-to-client encoding, or network throughput to become visible.
+But the replica is not unlimited. It still has its own CPU, RAM, and storage limits.
+
+The tricky part is replay lag. A replica can be slightly behind the primary. So if you use multiple replicas, one chunk might be read from a replica that is at source time T100, while another chunk is read from a replica at T105. Then your backfill is a mix of different moments. That is why the system needs reconciliation with the live CDC stream afterward.
+
+The sentence about "read isolation is often more valuable than raw speed" means this:
+
+A backfill that reads at 2 GB/s is not good if it makes customer queries painfully slow. Protecting production matters more than chasing the biggest backfill number.
+
+"Source-side admission" just means limiting how much backfill work is allowed at once. For example:
+
+only 4 active scans
+don't exceed a certain I/O rate
+slow down when source CPU or customer latency gets high
+
+A "token-bucket byte rate" is basically a byte-per-second limiter. If the backfill is allowed 500 MB/s, it has to wait if it tries to read faster than that.
+
+The second part is about proving whether the storage fix actually worked.
+
+You measure before and after:
+
+rows/s and bytes/s: did backfill throughput increase?
+MB/s: did the storage move more data?
+IOPS: how many read operations happened?
+average request size: were reads tiny/random or larger?
+wow
+queue depth: how much I/O was waiting/in flight
+P
+source/replica CPU
+customer p95/p99 query latency
+
+Then interpret it like this:
+
+If more workers cause:
+rows/s up,
+bytes/s up,
+and customer latency stays okay,
+
+then you successfully used unused storage capacity.
+
+If more workers cause:
+same total bytes/s,
+but latency gets worse,
+
+then storage is already saturated. More workers are just fighting over the same limit.
+
+Summary: use replicas to isolate heavy backfill reads from production, throttle backfill when necessary, and prove the fix with throughput, storage, and customer-latency metrics rather than just looking at worker count.
+
 
 ## 3. Caches: protect the production working set while streaming cold data
 

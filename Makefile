@@ -1,4 +1,4 @@
-.PHONY: test test-race build vet integration-up test-integration benchmark benchmark-matrix
+.PHONY: test test-race build vet integration-up test-integration test-snowflake-live test-snowflake-e2e benchmark benchmark-matrix benchmark-snowflake-stage snowflake-sink snowflake-backfill snowflake-validate snowflake-promote
 
 # Unit tests: no services required.
 test:
@@ -22,6 +22,27 @@ integration-up:
 test-integration:
 	go test -tags=integration -count=1 -timeout 600s ./integration/... ./internal/promotion
 
+# Creates isolated temporary Snowflake schemas and removes them after the run.
+# Requires SNOWFLAKE_DSN and SNOWFLAKE_DATABASE.
+test-snowflake-live:
+	go test -tags=snowflake_integration -count=1 -run '^TestLiveSnowflakeControlPlane$$' -v ./internal/snowflake
+
+# Requires the dedicated integration Compose stack plus Snowflake credentials.
+test-snowflake-e2e:
+	go test -tags='integration snowflake_integration' -count=1 -timeout 10m -run '^TestSnowflakeOnlineBackfillCrashRecovery$$' -v ./integration
+
+snowflake-sink:
+	go run ./cmd/seam-snowflake-sink
+
+snowflake-backfill:
+	go run ./cmd/seam-snowflake-backfill
+
+snowflake-validate:
+	go run ./cmd/seam-snowflake-promote validate
+
+snowflake-promote:
+	go run ./cmd/seam-snowflake-promote promote
+
 # Counterbalanced fixed-workload benchmark (1 vs 4 workers). Each worker count
 # runs in a fresh benchmark process; order alternates to cancel warmup bias.
 benchmark:
@@ -31,3 +52,7 @@ benchmark:
 # chunk sizes. Configure lists with ROWS_LIST/OWNER_BYTES_LIST/WORKERS_LIST/CHUNK_LIST.
 benchmark-matrix:
 	./scripts/bench-matrix.sh
+
+# Measures Snowflake snapshot staging only; it is not an end-to-end backfill.
+benchmark-snowflake-stage:
+	go test -tags=snowflake_integration -run '^$$' -bench '^BenchmarkLiveSnowflakeStageSnapshot$$' -benchtime=1x -count=1 ./internal/snowflake

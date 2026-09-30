@@ -1,5 +1,15 @@
 # SEAM engineering deep dive and interview defense guide
 
+> **Scope note (September 30, 2026):** This long report captures the earlier
+> PostgreSQL `accounts` implementation and its evidence in depth. SEAM has
+> since gained descriptor-driven PostgreSQL rows and a separate Snowflake CDC,
+> online-backfill, validation, and stable-view promotion path. Statements below
+> that call the whole repository fixed-schema or PostgreSQL-only describe that
+> earlier checkpoint. Read [`generic-row-design.md`](generic-row-design.md) and
+> [`snowflake.md`](snowflake.md) for the current additions. The PostgreSQL race,
+> recovery, fencing, and benchmark analysis remains the detailed reference for
+> that destination path.
+
 This document explains the code that exists in this working tree. It is written as a learning guide for someone who knows the basic idea of SEAM but needs to defend its design in front of an experienced CDC, PostgreSQL, or distributed-systems engineer.
 
 The working tree is currently **uncommitted**. That matters: this report describes the files on disk, including the large uncommitted implementation, rather than the last Git commit. The evidence boundary is also deliberate. Where a property is proved by code and tests, the report says so. Where it is an operating assumption or an unmeasured limit, the report says that instead.

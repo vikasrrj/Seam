@@ -1,15 +1,15 @@
-# SEAM operations: fixed-schema PostgreSQL path
+# SEAM operations: PostgreSQL destination path
 
-This runbook describes the implemented `public.accounts` → Kafka →
-PostgreSQL path. It is a narrow experimental contract, not a general-purpose
-connector. The source schema is `id BIGINT PRIMARY KEY`, `owner TEXT NOT NULL`,
-and `balance_cents BIGINT NOT NULL`; the destination must be a logged ordinary
-table with exactly that column layout and primary key. The source publication
-must include `accounts` and `seam_marker`, and Kafka must have one ordered
-partition. Source `accounts` must use `REPLICA IDENTITY FULL` so capture can
-reconstruct unchanged TOAST columns. Capture and each reconciler are separate
-long-running processes. Reconciler scan and destination-transaction admission
-is coordinated across processes with PostgreSQL session advisory locks.
+This runbook describes the implemented PostgreSQL → Kafka → PostgreSQL path,
+using `public.accounts` as the concrete example. It is a narrow experimental
+contract, not a general-purpose connector. The source may be another validated
+table in `public`, but it must have one `BIGINT` primary key, use only the
+closed type set in `internal/schema`, and use `REPLICA IDENTITY FULL`. The
+destination must be a logged ordinary table isomorphic to the source. The
+source publication must include the selected table and `seam_marker`, and
+Kafka must have one ordered partition. Capture and each reconciler are
+separate long-running processes. Reconciler scan and destination-transaction
+admission is coordinated across processes with PostgreSQL session advisory locks.
 Configure identical `SEAM_MAX_SOURCE_SCANS` and
 `SEAM_MAX_DESTINATION_TX` values for live and shadow processes; a session or
 process failure releases its permits.
@@ -66,7 +66,8 @@ conditions, but checking them beforehand reduces its source write pause.
 go run ./cmd/seam-promote --live-job live --shadow-job shadow-1 --timeout 10m
 ```
 
-Promotion first checks job/source/topic identity, fixed table schemas,
+The current PostgreSQL promotion command is specifically the
+`accounts`/`accounts_shadow` example. It first checks job/source/topic identity, table schemas,
 ownership, grants, and unsupported dependencies. It drains both jobs and uses
 `seam_cutover_gates` to converge them at one exact transaction boundary. A
 short source `SHARE` fence emits a validation barrier and establishes a
@@ -186,8 +187,11 @@ infer an Artie-like multiplier from it.
   tuple under the required `REPLICA IDENTITY FULL` contract. Open transactions spill above the 800 KiB
   memory threshold and publish as records bounded below 900 KiB. The hard
   event cap still stops pathological transactions without acknowledging WAL.
-- The production binary accepts only `accounts/id`; adaptive chunking is
-  disabled because it bypasses the durable manifest. Kafka is one partition.
+- Source and destination row layouts are descriptor-driven, but the source
+  must be in `public` with one `BIGINT` primary key and the supported type set.
+  PostgreSQL promotion remains specific to `accounts`/`accounts_shadow`.
+  Adaptive chunking is disabled because it bypasses the durable manifest.
+  Kafka is one partition.
 - The bundled Kafka broker has replication factor one. This is a development
   fixture, not a high-availability durability claim. Retention must exceed
   the longest restart, shadow backfill, and catch-up interval.

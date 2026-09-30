@@ -7,6 +7,8 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 
 	"example.com/seam/internal/retry"
 	"github.com/jackc/pgx/v5"
@@ -87,22 +89,37 @@ func postgresTLSFromEnv(host string) (*tls.Config, string, error) {
 	return tlsConfig, sslMode, nil
 }
 
-func KafkaOptions() []kgo.Opt {
+// KafkaOptions builds transport options and fails closed. A requested but
+// unreadable TLS certificate or a partial/unknown SASL configuration must not
+// silently downgrade a production replication stream to plaintext or unauthenticated access.
+func KafkaOptions() ([]kgo.Opt, error) {
 	var opts []kgo.Opt
 	tlsConfig, err := kafkaTLSFromEnv()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warn kafka tls config: %v\n", err)
-	} else if tlsConfig != nil {
+		return nil, fmt.Errorf("kafka TLS configuration: %w", err)
+	}
+	if tlsConfig != nil {
 		opts = append(opts, kgo.DialTLSConfig(tlsConfig))
 	}
-	if mechanism := kafkaSASLFromEnv(); mechanism != nil {
+	mechanism, err := kafkaSASLFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("kafka SASL configuration: %w", err)
+	}
+	if mechanism != nil {
 		opts = append(opts, kgo.SASL(mechanism))
 	}
-	return opts
+	return opts, nil
 }
 
 func kafkaTLSFromEnv() (*tls.Config, error) {
-	enabled := os.Getenv("KAFKA_TLS_ENABLED") == "true"
+	enabled := false
+	if raw := strings.TrimSpace(os.Getenv("KAFKA_TLS_ENABLED")); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("KAFKA_TLS_ENABLED: invalid boolean %q", raw)
+		}
+		enabled = parsed
+	}
 	caCert := os.Getenv("KAFKA_CA_CERT")
 	clientCert := os.Getenv("KAFKA_CLIENT_CERT")
 	clientKey := os.Getenv("KAFKA_CLIENT_KEY")
@@ -121,7 +138,10 @@ func kafkaTLSFromEnv() (*tls.Config, error) {
 		}
 		tlsConfig.RootCAs = pool
 	}
-	if clientCert != "" && clientKey != "" {
+	if (clientCert == "") != (clientKey == "") {
+		return nil, fmt.Errorf("KAFKA_CLIENT_CERT and KAFKA_CLIENT_KEY must be configured together")
+	}
+	if clientCert != "" {
 		cert, err := tls.LoadX509KeyPair(clientCert, clientKey)
 		if err != nil {
 			return nil, fmt.Errorf("load client cert: %w", err)
@@ -131,17 +151,23 @@ func kafkaTLSFromEnv() (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-func kafkaSASLFromEnv() sasl.Mechanism {
-	user := os.Getenv("KAFKA_SASL_USERNAME")
+func kafkaSASLFromEnv() (sasl.Mechanism, error) {
+	user := strings.TrimSpace(os.Getenv("KAFKA_SASL_USERNAME"))
 	pass := os.Getenv("KAFKA_SASL_PASSWORD")
+	mechanism := strings.TrimSpace(os.Getenv("KAFKA_SASL_MECHANISM"))
+	if user == "" && pass == "" && mechanism == "" {
+		return nil, nil
+	}
 	if user == "" || pass == "" {
-		return nil
+		return nil, fmt.Errorf("KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD must be configured together")
 	}
 	auth := scram.Auth{User: user, Pass: pass}
-	switch os.Getenv("KAFKA_SASL_MECHANISM") {
+	switch mechanism {
+	case "", "SCRAM-SHA-256":
+		return auth.AsSha256Mechanism(), nil
 	case "SCRAM-SHA-512":
-		return auth.AsSha512Mechanism()
+		return auth.AsSha512Mechanism(), nil
 	default:
-		return auth.AsSha256Mechanism()
+		return nil, fmt.Errorf("unsupported KAFKA_SASL_MECHANISM %q", mechanism)
 	}
 }

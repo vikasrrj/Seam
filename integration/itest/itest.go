@@ -179,9 +179,13 @@ func ResetTables(ctx context.Context) error {
 // metadata reflects the intended state, so callers start from a topic that is
 // actually readable.
 func resetKafkaTopic(ctx context.Context) error {
+	transportOptions, err := transport.KafkaOptions()
+	if err != nil {
+		return err
+	}
 	client, err := kgo.NewClient(append([]kgo.Opt{
 		kgo.SeedBrokers(KafkaBrokers()...),
-	}, transport.KafkaOptions()...)...)
+	}, transportOptions...)...)
 	if err != nil {
 		return err
 	}

@@ -12,6 +12,7 @@ import (
 	"example.com/seam/integration/itest"
 	"example.com/seam/internal/checkpoint"
 	"example.com/seam/internal/model"
+	"example.com/seam/internal/schema"
 	"example.com/seam/internal/transport"
 	"github.com/jackc/pgx/v5"
 )
@@ -49,13 +50,21 @@ func TestAtomicPromotionAndIdempotentRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close(context.Background())
+	sourceSchema, err := schema.LoadDestFromConn(ctx, conn, "public", "accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture models a validated source descriptor. Destination catalog
+	// loading intentionally does not require replica identity.
+	sourceSchema.ReplicaIdentity = "f"
+	sourceSchema.Fingerprint = sourceSchema.FingerprintFor()
 	if _, err := conn.Exec(ctx, `DROP TABLE accounts_shadow`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := conn.Exec(ctx, `CREATE TABLE accounts_shadow (id BIGINT NOT NULL, owner TEXT PRIMARY KEY, balance_cents BIGINT NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := checkpoint.FingerprintFor(ctx, conn, "accounts_shadow"); err == nil {
+	if _, err := checkpoint.FingerprintFor(ctx, conn, "accounts_shadow", sourceSchema); err == nil {
 		t.Fatal("schema fingerprint accepted a primary key on owner instead of id")
 	}
 	if _, err := conn.Exec(ctx, `DROP TABLE accounts_shadow`); err != nil {
@@ -71,15 +80,15 @@ func TestAtomicPromotionAndIdempotentRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := Config{DestDSN: dsn, LiveJobID: "live", ShadowJobID: "shadow"}
-	liveCP, err := store.CreateJob(ctx, model.JobConfig{JobID: "live", SourceDSN: "source", DestTable: "accounts"}, 10)
+	liveCP, err := store.CreateJob(ctx, model.JobConfig{JobID: "live", SourceDSN: "source", DestTable: "accounts"}, sourceSchema, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	shadowCP, err := store.CreateJob(ctx, model.JobConfig{JobID: "shadow", SourceDSN: "source", DestTable: "accounts_shadow"}, 10)
+	shadowCP, err := store.CreateJob(ctx, model.JobConfig{JobID: "shadow", SourceDSN: "source", DestTable: "accounts_shadow"}, sourceSchema, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateJob(ctx, model.JobConfig{JobID: "second-live", SourceDSN: "source", DestTable: "accounts"}, 10); err == nil {
+	if _, err := store.CreateJob(ctx, model.JobConfig{JobID: "second-live", SourceDSN: "source", DestTable: "accounts"}, sourceSchema, 10); err == nil {
 		t.Fatal("two active jobs claimed the same public destination table")
 	}
 	advance := func(cp *model.Checkpoint, offset int64) {
@@ -153,10 +162,10 @@ func TestAtomicPromotionAndIdempotentRetry(t *testing.T) {
 	if err := store.EnsureDestinationTableFor(ctx, "accounts_shadow"); err != nil {
 		t.Fatalf("next shadow table cannot be created after cutover: %v", err)
 	}
-	if _, err := checkpoint.FingerprintFor(ctx, conn, "accounts_shadow"); err != nil {
+	if _, err := checkpoint.FingerprintFor(ctx, conn, "accounts_shadow", sourceSchema); err != nil {
 		t.Fatalf("next shadow table has wrong schema: %v", err)
 	}
-	if _, err := store.CreateJob(ctx, model.JobConfig{JobID: "next-shadow", SourceDSN: "source", DestTable: "accounts_shadow"}, 10); err != nil {
+	if _, err := store.CreateJob(ctx, model.JobConfig{JobID: "next-shadow", SourceDSN: "source", DestTable: "accounts_shadow"}, sourceSchema, 10); err != nil {
 		t.Fatalf("inactive shadow job still owns physical route: %v", err)
 	}
 	shadowAfter, err := store.LoadCheckpoint(ctx, "shadow")

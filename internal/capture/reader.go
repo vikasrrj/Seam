@@ -99,7 +99,11 @@ func StartReader(ctx context.Context, cfg ReaderConfig) (*Reader, error) {
 		kgo.DefaultProduceTopic(cfg.KafkaTopic),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 	}
-	opts = append(opts, transport.KafkaOptions()...)
+	transportOptions, err := transport.KafkaOptions()
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts, transportOptions...)
 	kafkaClient, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("create kafka client: %w", err)
