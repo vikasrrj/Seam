@@ -387,10 +387,14 @@ func (s *Store) BeginChunkScan(ctx context.Context, lease *ChunkLease, lowMarker
 	return tx.Commit()
 }
 
-// StageSnapshot replaces one chunk's disposable candidate set in one DML
-// transaction. Batches bound statement size; a partial failure rolls back the
-// entire replacement and leaves the chunk resumable.
 func (s *Store) StageSnapshot(ctx context.Context, lease *ChunkLease, rows []model.Row) error {
+	if s.cfg.SnapshotLoader == SnapshotLoaderBulk {
+		return s.stageSnapshotBulk(ctx, lease, rows)
+	}
+	return s.stageSnapshotSQL(ctx, lease, rows)
+}
+
+func (s *Store) stageSnapshotSQL(ctx context.Context, lease *ChunkLease, rows []model.Row) error {
 	if err := validateLease(lease, s.cfg.StreamID); err != nil {
 		return err
 	}

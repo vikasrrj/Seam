@@ -41,7 +41,9 @@ The internal schema owns:
 | `MARKERS` | Durable LOW/HIGH/barrier positions observed by the sink |
 | `BACKFILL_JOBS` | Backfill, validation, and promotion state machine |
 | `BACKFILL_CHUNKS` | Sealed ranges, leases, fencing tokens, and scan markers |
+| `BACKFILL_FILES` | Content identity, size, state, chunk lease token, and stage path for each snapshot file |
 | `SNAPSHOT_STAGE` | Disposable bounded candidates for chunk finalization |
+| `SNAPSHOT_FILES` | Named internal stage containing compressed immutable chunk files |
 
 Snowflake constraints are informational, so SEAM enforces stream identity,
 frontier continuity, replay identity, route ownership, and state transitions
@@ -65,12 +67,16 @@ shadow even if no snapshot range includes it.
 
 Manifest sealing writes every gap-free range and changes `discovering` to
 `running` in one transaction. A worker leases a chunk with a fencing token,
-writes LOW, clears disposable stage rows, scans PostgreSQL, stages bounded
-candidate batches, writes HIGH, waits until the sink has committed HIGH, and
-finalizes. Finalization merges a candidate only when that key's CDC clock is at
-or before LOW. A CDC update or tombstone after LOW therefore wins over the
-older snapshot row. Target changes, chunk completion, and stage cleanup commit
-together; a stale worker that lost its lease rolls back.
+writes LOW, clears disposable stage rows, and scans PostgreSQL. It encodes the
+chunk as deterministic gzip JSON lines, records the file identity, uploads it
+to the named internal stage, and uses `COPY INTO` to replace that chunk's
+disposable candidates. The delete, copy, exact row count check, file state,
+and chunk row count commit together. It then writes HIGH, waits until the sink
+has committed HIGH, and finalizes. Finalization merges a candidate only when
+that key's CDC clock is at or before LOW. A CDC update or tombstone after LOW
+therefore wins over the older snapshot row. Target changes, chunk completion,
+and candidate cleanup commit together; a stale worker that lost its lease
+rolls back.
 
 Validation briefly takes a PostgreSQL `SHARE` fence, exports a repeatable-read
 snapshot, writes a marker, waits for the sink, and creates a Snowflake zero-copy
@@ -132,6 +138,10 @@ Backfill uses `SEAM_BACKFILL_JOB_ID`, `SEAM_BACKFILL_ATTEMPT`,
 `SNOWFLAKE_SHADOW_TABLE`, `SEAM_CHUNK_SIZE`, `SEAM_WORKERS`, `SEAM_WORKER_ID`,
 `SEAM_LEASE_DURATION`, `SEAM_HEARTBEAT_INTERVAL`,
 `SEAM_MAX_IN_MEMORY_CANDIDATES`, and `SEAM_MAX_CANDIDATE_BYTES`.
+`SEAM_SNOWFLAKE_SNAPSHOT_LOADER` selects `bulk` by default or the diagnostic
+`sql` path. `SEAM_SNOWFLAKE_BULK_TEMP_DIR` selects the local temporary
+directory, and `SEAM_SNOWFLAKE_UPLOAD_PARALLEL` controls Snowflake file upload
+parallelism from 1 through 99.
 
 Promotion uses `SNOWFLAKE_VALIDATION_TABLE`, `SEAM_MAX_WRITE_PAUSE`,
 `SEAM_SOURCE_LOCK_TIMEOUT`, and `SEAM_MAX_DELTA_KEYS`.
@@ -189,6 +199,12 @@ complete generation.
 - Reusing the same backfill job/attempt resumes its durable state. Different
   immutable parameters are rejected.
 - Expired chunk leases can be taken over; old workers are fenced by token.
+- A bulk-loader retry regenerates the same content-addressed file for the same
+  lease. `PUT` may be repeated. The transaction deletes that chunk's
+  disposable candidates, executes `COPY INTO ... FORCE=TRUE`, verifies the
+  exact row count, and advances the manifest and chunk together. An expired
+  worker may leave an unused file in the internal stage, but cannot publish
+  candidates or progress after takeover.
 - Validation restart creates a new source snapshot and marker because an
   exported PostgreSQL snapshot cannot survive its connection.
 - Promotion restart repeats an idempotent view assignment and completes route
@@ -217,6 +233,14 @@ transactions, offset initialization, two-phase backfill creation, manifest
 sealing, sink lease takeover/fencing, zero-copy validation clone, stable-view
 promotion, and cleanup.
 
+The component benchmark runs the old SQL loader and the bulk loader with the
+same row counts and payload widths. It writes raw JSON output plus host, commit,
+and workload metadata under the ignored `benchmark-results` directory.
+
+```bash
+make benchmark-snowflake-load
+```
+
 With the dedicated PostgreSQL/Kafka integration stack running, the combined
 test deliberately stops the sink and coordinator, takes over under new epochs
 and leases, validates, promotes twice, and compares every source and Snowflake
@@ -236,15 +260,19 @@ recovery scenario, not a throughput benchmark.
 ## Current performance limits
 
 Correctness is implemented ahead of warehouse-scale throughput. CDC uses one
-Kafka partition and stages bounded rows with parameterized inserts before
-set-based `MERGE`. Snapshot workers also stage bounded row batches. There is no
-object-storage file writer, `COPY INTO`, Snowpipe Streaming path, multi-partition
-ordering protocol, adaptive warehouse controller, or large Snowflake benchmark
-yet. An executed September 30, 2026 staging-only sample reached 36.6, 160.3,
-and 188.1 rows/s for 100, 1,000, and 5,000 rows respectively. This is not an
-end-to-end result, but it proves parameterized row staging is currently the
-immediate Snowflake throughput limit. The next performance milestone should
-replace row staging with immutable files plus `COPY INTO`, preserve the same
-ledger/frontier transaction boundary, and measure bytes/second, rows/second,
-merge time, warehouse credits, source impact, Kafka lag, and recovery time
-under fixed row-width distributions.
+Kafka partition and stages bounded rows with parameterized inserts before a
+set based `MERGE`. Snapshot workers use deterministic compressed files,
+Snowflake `PUT`, and `COPY INTO`; the lease fenced candidate merge remains a
+separate step. The internal stage currently retains uploaded files, including
+orphans from workers fenced after upload, so operators must account for stage
+storage until a proven garbage collector exists. There is no Snowpipe Streaming
+path, multi-partition ordering protocol, adaptive warehouse controller, or
+large Snowflake benchmark yet.
+
+The September 30, 2026 SQL-loader baseline reached 36.6, 160.3, and 188.1
+rows/s for 100, 1,000, and 5,000 rows. It is not an end-to-end result. The bulk
+path has not yet been run against a live account in the current revision, so no
+improvement is claimed. The next measurement must report bytes per second,
+rows per second, file encoding and upload time, copy and merge time, warehouse
+size and credits, source impact, Kafka lag, and recovery time under fixed row
+width distributions.

@@ -1091,8 +1091,8 @@ overhead.
 
 ### Snowflake destination
 
-The current immediate bottleneck is row staging with parameterized multi-row
-SQL before set-based `MERGE`. An executed component measurement reached:
+The original snapshot path staged rows with parameterized multi-row SQL before
+the set based `MERGE`. Its executed component baseline reached:
 
 | Staged rows | Wall time | Rows/s |
 | ---: | ---: | ---: |
@@ -1101,15 +1101,15 @@ SQL before set-based `MERGE`. An executed component measurement reached:
 | 5,000 | 26.58 s | 188.1 |
 
 This is not full-pipeline throughput. It excludes PostgreSQL scanning, Kafka,
-LOW/HIGH catch-up, final merge, validation, and promotion. It does show that
-adding more workers before changing the load mechanism would mainly create
-warehouse contention.
+LOW/HIGH catch-up, final merge, validation, and promotion. SEAM now replaces
+that mechanism by default with one deterministic compressed file per chunk,
+`PUT`, and a lease-fenced transactional `COPY INTO`. The old SQL path remains
+as the control. No post-change live number is recorded yet.
 
 ### The justified Snowflake performance step
 
-The next performance experiment would encode immutable staged files, upload
-them, and use `COPY INTO` or an equivalent bulk interface. The existing
-ledger/frontier/key-clock correctness boundary should remain. Then measure:
+Run the SQL and bulk loaders against the same isolated schemas and workload,
+then measure:
 
 - rows/s and uncompressed/compressed bytes/s;
 - file size and count;
@@ -1464,12 +1464,12 @@ protocol.
 
 ### “Can this reach Artie's public backfill numbers?”
 
-> Not with the current Snowflake row-staging path, and I would not promise a
-> multiplier without comparable workload and infrastructure. SEAM first needs
-> bulk file loading, then controlled experiments that record row width, bytes,
-> source load, warehouse size, merge cost, credits, lag, and recovery. The
-> present project demonstrates the correctness architecture and identifies the
-> current bottleneck honestly.
+> I would not promise a multiplier without comparable workload and
+> infrastructure. SEAM now has a lease-fenced bulk snapshot path using
+> deterministic compressed files, `PUT`, and transactional `COPY INTO`, but it
+> still needs controlled experiments that record row width, bytes, source
+> load, warehouse size, merge cost, credits, lag, and recovery. Implementing a
+> faster mechanism is not evidence of an Artie-scale result by itself.
 
 ### “Why not build more connectors?”
 
@@ -1569,9 +1569,11 @@ Use this narrative in a technical conversation:
 >
 > Finally, I measured instead of copying vendor claims. PostgreSQL gained about
 > 2× from four workers in the latest exact-verified smoke runs. Snowflake row
-> staging plateaued around 188 rows/s in the component measurement, so the next
-> justified performance experiment is bulk file loading. I stopped before
-> turning unmeasured ideas into claims.
+> staging plateaued around 188 rows/s in the original component measurement.
+> I replaced that path with deterministic bulk files plus `PUT` and
+> transactional `COPY INTO`, while retaining the SQL path as a benchmark
+> control. The post-change live comparison is still unmeasured, so I do not
+> turn the mechanism into a throughput claim.
 
 ---
 
@@ -1614,7 +1616,10 @@ definitions.
 - **CDC stage:** bounded set for one transaction.
 - **Markers:** observed control boundaries.
 - **Backfill job/chunks:** durable state machine and workers.
+- **Backfill files:** content hash, file size, stage path, lease token, and load
+  state for each bulk snapshot file.
 - **Snapshot stage:** disposable candidates.
+- **Snapshot file stage:** uploaded compressed chunk files retained for retry.
 - **Public view:** stable consumer-facing pointer.
 
 ---

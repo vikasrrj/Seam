@@ -1,4 +1,4 @@
-.PHONY: test test-race build vet integration-up test-integration test-snowflake-live test-snowflake-e2e benchmark benchmark-matrix benchmark-snowflake-stage snowflake-sink snowflake-backfill snowflake-validate snowflake-promote
+.PHONY: test test-race build vet integration-up test-integration test-snowflake-live test-snowflake-e2e benchmark benchmark-matrix benchmark-snowflake-stage benchmark-snowflake-load snowflake-sink snowflake-backfill snowflake-validate snowflake-promote
 
 # Unit tests: no services required.
 test:
@@ -53,6 +53,8 @@ benchmark:
 benchmark-matrix:
 	./scripts/bench-matrix.sh
 
-# Measures Snowflake snapshot staging only; it is not an end-to-end backfill.
+# Runs the SQL and bulk Snowflake snapshot loaders with identical inputs.
 benchmark-snowflake-stage:
-	go test -tags=snowflake_integration -run '^$$' -bench '^BenchmarkLiveSnowflakeStageSnapshot$$' -benchtime=1x -count=1 ./internal/snowflake
+	./scripts/bench-snowflake-load.sh
+
+benchmark-snowflake-load: benchmark-snowflake-stage

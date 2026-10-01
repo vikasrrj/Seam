@@ -43,6 +43,9 @@ type config struct {
 	poll           time.Duration
 	maxRows        int
 	maxBytes       int64
+	snapshotLoader seamsnowflake.SnapshotLoader
+	bulkTempDir    string
+	uploadParallel int
 }
 
 func main() {
@@ -85,6 +88,7 @@ func run(ctx context.Context, cfg config) error {
 	store, err := seamsnowflake.NewStore(db, seamsnowflake.Config{
 		Database: cfg.database, Schema: cfg.dataSchema, InternalSchema: cfg.internalSchema,
 		LiveTable: cfg.liveTable, StreamID: cfg.streamID, TopicID: topicID, Partition: 0,
+		SnapshotLoader: cfg.snapshotLoader, BulkTempDir: cfg.bulkTempDir, UploadParallel: cfg.uploadParallel,
 	}, scanner.Schema())
 	if err != nil {
 		return err
@@ -140,12 +144,17 @@ func loadConfig() (config, error) {
 		attempt:        envOrDefault("SEAM_BACKFILL_ATTEMPT", "attempt-1"),
 		shadowTable:    envOrDefault("SNOWFLAKE_SHADOW_TABLE", "ACCOUNTS_SHADOW"),
 		workerID:       envOrDefault("SEAM_WORKER_ID", fmt.Sprintf("%s-%d", host, os.Getpid())),
+		snapshotLoader: seamsnowflake.SnapshotLoader(envOrDefault("SEAM_SNOWFLAKE_SNAPSHOT_LOADER", string(seamsnowflake.SnapshotLoaderBulk))),
+		bulkTempDir:    envOrDefault("SEAM_SNOWFLAKE_BULK_TEMP_DIR", os.TempDir()),
 	}
 	if cfg.snowflakeDSN == "" || cfg.database == "" {
 		return config{}, fmt.Errorf("SNOWFLAKE_DSN and SNOWFLAKE_DATABASE are required")
 	}
 	if len(cfg.kafkaBrokers) == 0 {
 		return config{}, fmt.Errorf("KAFKA_BROKERS must contain at least one broker")
+	}
+	if cfg.snapshotLoader != seamsnowflake.SnapshotLoaderBulk && cfg.snapshotLoader != seamsnowflake.SnapshotLoaderSQL {
+		return config{}, fmt.Errorf("SEAM_SNOWFLAKE_SNAPSHOT_LOADER must be %q or %q", seamsnowflake.SnapshotLoaderBulk, seamsnowflake.SnapshotLoaderSQL)
 	}
 	var err error
 	if cfg.chunkSize, err = positiveIntEnv("SEAM_CHUNK_SIZE", 10_000); err != nil {
@@ -159,6 +168,12 @@ func loadConfig() (config, error) {
 	}
 	if cfg.maxBytes, err = positiveInt64Env("SEAM_MAX_CANDIDATE_BYTES", 256<<20); err != nil {
 		return config{}, err
+	}
+	if cfg.uploadParallel, err = positiveIntEnv("SEAM_SNOWFLAKE_UPLOAD_PARALLEL", 4); err != nil {
+		return config{}, err
+	}
+	if cfg.uploadParallel > 99 {
+		return config{}, fmt.Errorf("SEAM_SNOWFLAKE_UPLOAD_PARALLEL must not exceed 99")
 	}
 	if cfg.chunkSize > cfg.maxRows {
 		return config{}, fmt.Errorf("SEAM_CHUNK_SIZE must not exceed SEAM_MAX_IN_MEMORY_CANDIDATES")

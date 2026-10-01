@@ -206,13 +206,43 @@ Rows contained a `BIGINT` key and a 96-byte text value.
 | 5,000 | 26.5800 s | 188.1 | 0.02 |
 
 The rise from 36.6 to 188.1 rows/s shows fixed request/transaction overhead is
-amortized by larger batches. The plateau near 188 rows/s shows the current
-parameterized row-staging path is the immediate warehouse-side bottleneck for
-this workload. Increasing backfill workers before replacing that path would
-mostly add concurrent SQL and warehouse contention. The justified next
-experiment is immutable staged files plus `PUT`/`COPY INTO` (or an equivalent
-bulk API), followed by the same benchmark and a full source-to-promotion run.
+amortized by larger batches. At the time, the plateau near 188 rows/s identified
+parameterized row staging as the immediate warehouse-side bottleneck for this
+workload. That baseline motivated the bulk loader described below.
 
 This was one execution per size against the configured account. Warehouse
 size, cache state, network path, and credit consumption were not captured, so
 the absolute values must not be compared with vendor results or extrapolated.
+
+## Snowflake bulk-loader comparison
+
+The snapshot path now has two selectable implementations. `sql` is the former
+parameterized `INSERT ... UNION ALL` control. `bulk` writes deterministic gzip
+JSON lines, records a durable file manifest, uploads with `PUT`, and reloads
+the chunk's disposable candidate rows with `COPY INTO`. The copy transaction
+also verifies the exact staged row count and advances the file and chunk state
+under the current lease token.
+
+Run both paths against identical inputs with:
+
+```bash
+make benchmark-snowflake-load
+```
+
+The following environment variables define the experiment:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SEAM_SNOWFLAKE_BENCH_ROWS` | `100,1000,5000` | comma separated row counts |
+| `SEAM_SNOWFLAKE_BENCH_PAYLOAD_BYTES` | `96` | text bytes per row, excluding the key |
+| `SEAM_SNOWFLAKE_UPLOAD_PARALLEL` | `4` | file upload parallelism |
+| `LOADERS` | `sql bulk` | implementations to run in order |
+| `RESULT_DIR` | `benchmark-results/snowflake` | ignored directory for raw output |
+
+Each case creates isolated schemas and removes them afterward. The timed region
+contains only snapshot staging. PostgreSQL scanning, Kafka, LOW/HIGH catch-up,
+candidate finalization, validation, and promotion remain outside the timer.
+The script records the exact commit, dirty state, Go version, host, kernel, and
+workload beside raw `go test -json` output. There is no post-change live result
+in this document yet; the loader is implemented and tested, but its throughput
+must not be inferred from the design.

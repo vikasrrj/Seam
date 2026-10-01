@@ -12,7 +12,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.chunkSize != 10_000 || cfg.workers != 4 || cfg.lease != 2*time.Minute || cfg.heartbeat != 40*time.Second {
+	if cfg.chunkSize != 10_000 || cfg.workers != 4 || cfg.lease != 2*time.Minute || cfg.heartbeat != 40*time.Second || cfg.snapshotLoader != "bulk" || cfg.uploadParallel != 4 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 }
@@ -27,6 +27,8 @@ func TestLoadConfigRejectsInvalidResourceBounds(t *testing.T) {
 		{name: "workers", env: map[string]string{"SEAM_WORKERS": "many"}, match: "positive integer"},
 		{name: "memory row cap", env: map[string]string{"SEAM_CHUNK_SIZE": "101", "SEAM_MAX_IN_MEMORY_CANDIDATES": "100"}, match: "must not exceed"},
 		{name: "byte cap", env: map[string]string{"SEAM_MAX_CANDIDATE_BYTES": "-1"}, match: "positive integer"},
+		{name: "snapshot loader", env: map[string]string{"SEAM_SNOWFLAKE_SNAPSHOT_LOADER": "fast"}, match: "must be"},
+		{name: "upload parallel", env: map[string]string{"SEAM_SNOWFLAKE_UPLOAD_PARALLEL": "100"}, match: "must not exceed"},
 		{name: "lease", env: map[string]string{"SEAM_LEASE_DURATION": "never"}, match: "positive duration"},
 		{name: "heartbeat", env: map[string]string{"SEAM_LEASE_DURATION": "1s", "SEAM_HEARTBEAT_INTERVAL": "1s"}, match: "shorter"},
 	}
@@ -51,6 +53,7 @@ func baseEnvironment(t *testing.T) {
 		"SEAM_BACKFILL_JOB_ID", "SEAM_BACKFILL_ATTEMPT", "SNOWFLAKE_SHADOW_TABLE", "SEAM_WORKER_ID",
 		"SEAM_CHUNK_SIZE", "SEAM_WORKERS", "SEAM_MAX_IN_MEMORY_CANDIDATES", "SEAM_MAX_CANDIDATE_BYTES",
 		"SEAM_LEASE_DURATION", "SEAM_HEARTBEAT_INTERVAL", "SEAM_SNOWFLAKE_MARKER_POLL",
+		"SEAM_SNOWFLAKE_SNAPSHOT_LOADER", "SEAM_SNOWFLAKE_BULK_TEMP_DIR", "SEAM_SNOWFLAKE_UPLOAD_PARALLEL",
 	} {
 		t.Setenv(name, "")
 	}

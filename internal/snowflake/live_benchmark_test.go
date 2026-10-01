@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,18 +17,20 @@ import (
 	_ "github.com/snowflakedb/gosnowflake/v2"
 )
 
-// BenchmarkLiveSnowflakeStageSnapshot measures the current parameterized
-// snapshot staging path in isolation. It is not an end-to-end backfill claim:
-// PostgreSQL scan, Kafka, marker catch-up, final MERGE, and validation are
-// deliberately outside the timer.
 func BenchmarkLiveSnowflakeStageSnapshot(b *testing.B) {
 	dsn := os.Getenv("SNOWFLAKE_DSN")
 	database := os.Getenv("SNOWFLAKE_DATABASE")
 	if dsn == "" || database == "" {
 		b.Skip("SNOWFLAKE_DSN and SNOWFLAKE_DATABASE are required")
 	}
-	for _, rowCount := range []int{100, 1000, 5000} {
-		b.Run(fmt.Sprintf("rows_%d", rowCount), func(b *testing.B) {
+	loader := SnapshotLoader(envOrBenchmarkDefault("SEAM_SNOWFLAKE_BENCH_LOADER", string(SnapshotLoaderBulk)))
+	if loader != SnapshotLoaderBulk && loader != SnapshotLoaderSQL {
+		b.Fatalf("SEAM_SNOWFLAKE_BENCH_LOADER must be %q or %q", SnapshotLoaderBulk, SnapshotLoaderSQL)
+	}
+	payloadBytes := benchmarkPositiveInt(b, "SEAM_SNOWFLAKE_BENCH_PAYLOAD_BYTES", 96)
+	uploadParallel := benchmarkPositiveInt(b, "SEAM_SNOWFLAKE_UPLOAD_PARALLEL", 4)
+	for _, rowCount := range benchmarkRowCounts(b) {
+		b.Run(fmt.Sprintf("%s/rows_%d/bytes_%d", loader, rowCount, payloadBytes), func(b *testing.B) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			db, err := sql.Open("snowflake", dsn)
@@ -43,7 +46,8 @@ func BenchmarkLiveSnowflakeStageSnapshot(b *testing.B) {
 				Database: database, Schema: "SEAM_BENCH_" + suffix,
 				InternalSchema: "SEAM_BENCH_INTERNAL_" + suffix,
 				LiveTable:      "ACCOUNTS", StreamID: "bench-" + suffix,
-				TopicID: "benchmark-topic", Partition: 0,
+				TopicID: "benchmark-topic", Partition: 0, SnapshotLoader: loader,
+				BulkTempDir: os.TempDir(), UploadParallel: uploadParallel,
 			}
 			defer func() {
 				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
@@ -78,11 +82,12 @@ func BenchmarkLiveSnowflakeStageSnapshot(b *testing.B) {
 				b.Fatal(err)
 			}
 			rows := make([]model.Row, rowCount)
-			payload := strings.Repeat("x", 96)
+			payload := strings.Repeat("x", payloadBytes)
 			for index := range rows {
 				rows[index] = model.Row{Values: []model.Value{model.Int64Value(int64(index + 1)), model.TextValue(payload)}}
 			}
-			b.SetBytes(int64(rowCount * (len(payload) + 8)))
+			logicalBytes := int64(rowCount * (len(payload) + 8))
+			b.SetBytes(logicalBytes)
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
 				if err := store.StageSnapshot(ctx, lease, rows); err != nil {
@@ -91,6 +96,37 @@ func BenchmarkLiveSnowflakeStageSnapshot(b *testing.B) {
 			}
 			b.StopTimer()
 			b.ReportMetric(float64(rowCount*b.N)/b.Elapsed().Seconds(), "rows/s")
+			b.ReportMetric(float64(logicalBytes*int64(b.N))/b.Elapsed().Seconds()/(1024*1024), "MiB/s")
 		})
 	}
+}
+
+func benchmarkRowCounts(b *testing.B) []int {
+	b.Helper()
+	parts := strings.Split(envOrBenchmarkDefault("SEAM_SNOWFLAKE_BENCH_ROWS", "100,1000,5000"), ",")
+	rows := make([]int, 0, len(parts))
+	for _, part := range parts {
+		value, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || value < 1 {
+			b.Fatalf("SEAM_SNOWFLAKE_BENCH_ROWS contains invalid positive integer %q", part)
+		}
+		rows = append(rows, value)
+	}
+	return rows
+}
+
+func benchmarkPositiveInt(b *testing.B, name string, fallback int) int {
+	b.Helper()
+	value, err := strconv.Atoi(envOrBenchmarkDefault(name, strconv.Itoa(fallback)))
+	if err != nil || value < 1 {
+		b.Fatalf("%s must be a positive integer", name)
+	}
+	return value
+}
+
+func envOrBenchmarkDefault(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
 }

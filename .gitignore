@@ -6,3 +6,6 @@
 # test artifacts
 *.test
 *.out
+
+# local benchmark output
+/benchmark-results/

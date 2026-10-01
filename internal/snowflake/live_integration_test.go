@@ -44,6 +44,7 @@ func TestLiveSnowflakeControlPlane(t *testing.T) {
 		LiveTable:      "ACCOUNTS", StreamID: "integration-" + suffix,
 		TopicID: "integration-topic", Partition: 0,
 	}
+	cfg = cfg.withDefaults()
 	if err := cfg.validate(); err != nil {
 		t.Fatal(err)
 	}

@@ -8,6 +8,7 @@ package snowflake
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
@@ -15,6 +16,13 @@ import (
 )
 
 var identifierPattern = regexp.MustCompile("^[A-Za-z_][A-Za-z0-9_$]*$")
+
+type SnapshotLoader string
+
+const (
+	SnapshotLoaderBulk SnapshotLoader = "bulk"
+	SnapshotLoaderSQL  SnapshotLoader = "sql"
+)
 
 // Config identifies the Snowflake objects owned by one SEAM pipeline.
 type Config struct {
@@ -25,6 +33,22 @@ type Config struct {
 	StreamID       string
 	TopicID        string
 	Partition      int32
+	SnapshotLoader SnapshotLoader
+	BulkTempDir    string
+	UploadParallel int
+}
+
+func (c Config) withDefaults() Config {
+	if c.SnapshotLoader == "" {
+		c.SnapshotLoader = SnapshotLoaderBulk
+	}
+	if c.BulkTempDir == "" {
+		c.BulkTempDir = os.TempDir()
+	}
+	if c.UploadParallel == 0 {
+		c.UploadParallel = 4
+	}
+	return c
 }
 
 func (c Config) validate() error {
@@ -44,6 +68,15 @@ func (c Config) validate() error {
 	}
 	if c.Partition != 0 {
 		return fmt.Errorf("SEAM currently requires Kafka partition 0, got %d", c.Partition)
+	}
+	if c.SnapshotLoader != SnapshotLoaderBulk && c.SnapshotLoader != SnapshotLoaderSQL {
+		return fmt.Errorf("invalid Snowflake snapshot loader %q", c.SnapshotLoader)
+	}
+	if strings.TrimSpace(c.BulkTempDir) == "" {
+		return fmt.Errorf("Snowflake bulk temporary directory is required")
+	}
+	if c.UploadParallel < 1 || c.UploadParallel > 99 {
+		return fmt.Errorf("Snowflake upload parallelism must be between 1 and 99")
 	}
 	return nil
 }

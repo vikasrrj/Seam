@@ -147,21 +147,25 @@ rows per second with one worker and 6,717 rows per second with four workers.
 This is about a 1.99 times wall clock improvement for that single local pair.
 It is not evidence of performance at millions or billions of rows.
 
-The current Snowflake snapshot staging path reached about 188 rows per second
-at 5,000 rows in its component benchmark. That result identifies row staging
-as the immediate Snowflake bottleneck. A future performance version would use
-immutable staged files and Snowflake COPY INTO while preserving the existing
-ledger and frontier rules.
+The original Snowflake snapshot path reached about 188 rows per second at
+5,000 rows because it issued parameterized SQL batches. SEAM now writes one
+deterministic compressed JSON file per leased chunk, uploads it to an internal
+Snowflake stage, and reloads the disposable candidate table with `COPY INTO`.
+The SQL and bulk paths can be compared with the same component benchmark. No
+post-change live result is recorded yet, so the repository does not claim a
+speedup from the new path without measurement.
 
 Raw results and measurement boundaries are recorded in
 [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Current limitations
 
-The main limitations are one Kafka partition, one table per pipeline, no
-online schema evolution, and no warehouse bulk file loader. The bundled Kafka
-stack is for development and does not provide a production availability claim.
-Large scale source impact and warehouse cost have not been measured.
+The main limitations are one Kafka partition, one table per pipeline, and no
+online schema evolution. Snowflake snapshot chunks use a bulk file loader, but
+CDC transactions still use bounded SQL staging and set based merges. The
+bundled Kafka stack is for development and does not provide a production
+availability claim. Large scale source impact, warehouse cost, and bulk loader
+throughput have not been measured.
 
 These limits are intentional. SEAM currently prioritizes transaction
 correctness, recovery, fencing, exact validation, and honest evidence over
