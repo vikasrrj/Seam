@@ -8,8 +8,6 @@ import (
 	"testing"
 )
 
-// TestSeamLabCLIRejectsBadArguments runs the built seam-lab binary with
-// missing or unknown subcommands and requires a non-zero exit with usage.
 func TestSeamLabCLIRejectsBadArguments(t *testing.T) {
 	bin := buildBinary(t)
 	cases := []struct {
@@ -44,7 +42,6 @@ func buildBinary(t *testing.T) string {
 	return bin
 }
 
-// repoRoot walks up from the test working directory to the module root.
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	dir, err := os.Getwd()

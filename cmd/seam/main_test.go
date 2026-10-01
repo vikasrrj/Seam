@@ -194,8 +194,6 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
-// TestSeamCLIInvalidArguments runs the real seam binary with invalid or
-// missing arguments and requires a non-zero exit with a clear diagnostic.
 func TestSeamCLIInvalidArguments(t *testing.T) {
 	bin := buildCmdBinary(t, "./cmd/seam")
 	cases := []struct {
@@ -233,7 +231,6 @@ func TestSeamCLIInvalidArguments(t *testing.T) {
 	}
 }
 
-// buildCmdBinary compiles one command into a temp directory.
 func buildCmdBinary(t *testing.T, pkg string) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "seam-bin")
@@ -246,7 +243,6 @@ func buildCmdBinary(t *testing.T, pkg string) string {
 	return bin
 }
 
-// repoRoot walks up from the test working directory to the module root.
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	dir, err := os.Getwd()
@@ -265,8 +261,6 @@ func repoRoot(t *testing.T) string {
 	}
 }
 
-// runBinary executes a built binary with an optional env overlay and returns
-// its combined output and exit code.
 func runBinary(t *testing.T, bin string, env map[string]string, args []string) (string, int, error) {
 	t.Helper()
 	cmd := exec.Command(bin, args...)

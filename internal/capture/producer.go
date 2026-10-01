@@ -10,7 +10,7 @@ import (
 // must durably produce one record (a complete source transaction) and close.
 // The production implementation wraps a franz-go client; deterministic tests
 // substitute a stub to exercise the in-flight-publish shutdown path without a
-// broker. This is intentionally the smallest abstraction — not a mocked Kafka.
+// broker. This is the smallest abstraction needed by the reader.
 type transactionProducer interface {
 	// ProduceSync blocks until the record is acknowledged by the broker, the
 	// context ends, or a fatal error occurs. It returns the record-level

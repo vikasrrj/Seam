@@ -82,7 +82,7 @@ func (s *Sizer) Observe(duration time.Duration, rows int) {
 			s.durations = append(s.durations[:0], s.durations[1:]...)
 		}
 	}
-	// rows is informational for now; duration is the feedback signal.
+	// Chunk sizing uses duration as its feedback signal.
 	_ = rows
 
 	if len(s.durations) < warmup {

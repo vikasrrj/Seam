@@ -36,7 +36,6 @@ func TestChaos_CrashRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("source conn: %v", err)
 	}
-	// Seed with a small table so there is data to mutate.
 	for i := int64(1); i <= 20; i++ {
 		if _, err := src.Exec(ctx,
 			`INSERT INTO accounts (id, owner, balance_cents) VALUES ($1, $2, $3)`,
@@ -122,8 +121,6 @@ func TestChaos_CrashRestart(t *testing.T) {
 		t.Fatalf("discover chunks: %v", err)
 	}
 
-	// startReconciler starts the reconciler from the given checkpoint and returns
-	// a cancel func + error channel.
 	startReconciler := func(ctx context.Context, checkpoint *model.Checkpoint) (context.CancelFunc, <-chan error) {
 		recCtx, recCancel := context.WithCancel(ctx)
 		consumer, err := kafka.NewConsumer(itest.KafkaBrokers(), itest.KafkaTopic(), checkpoint.NextKafkaOffset, func(data []byte) (model.Change, error) {
@@ -189,7 +186,6 @@ func TestChaos_CrashRestart(t *testing.T) {
 					recErrCh <- nil
 					return
 				}
-				// Exited after cancel: restart.
 			case <-restartCh:
 				recCancel()
 				if err := <-ch; err != nil && !errors.Is(err, context.Canceled) {
@@ -197,7 +193,6 @@ func TestChaos_CrashRestart(t *testing.T) {
 					return
 				}
 				_ = cancel
-				// Shutdown drained; restart immediately.
 			case <-loopCtx.Done():
 				recCancel()
 				<-ch
@@ -298,7 +293,6 @@ func TestChaos_CrashRestart(t *testing.T) {
 		t.Fatalf("wait for final source barrier in Kafka: %v", err)
 	}
 
-	// Wait for reconciler to catch up to final source state.
 	srcCheck, err := itest.SourceConn(ctx)
 	if err != nil {
 		t.Fatalf("source check conn: %v", err)
@@ -361,7 +355,6 @@ func TestChaos_CrashRestart(t *testing.T) {
 			mutationSeed, mutationCount, sourceCount, destCount, completed, nextOffset, barrierOffset, applied)
 	}
 
-	// Stop reconciler loop gracefully.
 	loopCancel()
 	select {
 	case err := <-recErrCh:
@@ -372,7 +365,6 @@ func TestChaos_CrashRestart(t *testing.T) {
 		t.Fatal("reconciler loop did not stop")
 	}
 
-	// Final exact verification: every source row matches destination, and counts match.
 	if err := verifyExact(ctx); err != nil {
 		t.Fatalf("final verification failed: %v", err)
 	}
@@ -430,7 +422,5 @@ func verifyExact(ctx context.Context) error {
 		return err
 	}
 
-	// Source count matched dest count and every source row matched, so the tables
-	// are identical.
 	return nil
 }

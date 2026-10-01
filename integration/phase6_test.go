@@ -5,7 +5,6 @@ package integration
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -191,7 +190,6 @@ func TestPhase6_HardCases(t *testing.T) {
 	}
 	src.Close(context.Background())
 
-	// Wait for backfill and CDC to settle.
 	dst, err := itest.DestConn(ctx)
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
@@ -212,10 +210,8 @@ func TestPhase6_HardCases(t *testing.T) {
 		t.Fatalf("backfill did not complete: completed_through=%d upper_bound=%d", completed, upperBound)
 	}
 
-	// Wait a bit more for trailing CDC.
 	time.Sleep(3 * time.Second)
 
-	// Verify final state matches source.
 	expected := map[int64]struct {
 		owner   string
 		balance int64
@@ -266,5 +262,4 @@ func TestPhase6_HardCases(t *testing.T) {
 		t.Fatal("reconciler did not stop")
 	}
 
-	fmt.Println("Phase 6 hard cases verified")
 }

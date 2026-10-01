@@ -158,7 +158,6 @@ func TestPhase9_CDCContinuity(t *testing.T) {
 		t.Fatalf("backfill did not complete: completed_through=%d upper_bound=%d", completed, upperBound)
 	}
 
-	// Apply live changes on the source after backfill.
 	src, err = itest.SourceConn(ctx)
 	if err != nil {
 		t.Fatalf("source conn for live changes: %v", err)
@@ -174,7 +173,6 @@ func TestPhase9_CDCContinuity(t *testing.T) {
 	}
 	src.Close(context.Background())
 
-	// Wait for CDC to reach destination.
 	for i := 0; i < 60; i++ {
 		var count int
 		if err := dst.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&count); err != nil {
@@ -220,5 +218,4 @@ func TestPhase9_CDCContinuity(t *testing.T) {
 		t.Fatal("reconciler did not stop")
 	}
 
-	fmt.Println("Phase 9 CDC continuity verified")
 }

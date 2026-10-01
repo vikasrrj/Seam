@@ -104,7 +104,6 @@ func IsRetryableKafka(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	// Treat retriable Kafka errors as transient.
 	var ke *kerr.Error
 	if errors.As(err, &ke) && ke.Retriable {
 		return true

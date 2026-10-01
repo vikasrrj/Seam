@@ -117,6 +117,5 @@ func checkSlotContinuity(ctx context.Context, dsn, slot string) error {
 }
 
 func logPrintf(format string, args ...interface{}) {
-	// Use fmt.Printf for now; telemetry can redirect later.
 	fmt.Printf("seam: "+format+"\n", args...)
 }

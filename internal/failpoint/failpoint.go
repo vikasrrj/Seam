@@ -138,7 +138,6 @@ func (p *Point) Trigger() {
 	defer p.mu.Unlock()
 	select {
 	case <-p.trigger:
-		// already triggered this cycle
 	default:
 		close(p.trigger)
 	}
@@ -153,7 +152,6 @@ func (p *Point) Resume() {
 	defer p.mu.Unlock()
 	select {
 	case <-p.resume:
-		// already resumed this cycle
 	default:
 		close(p.resume)
 	}

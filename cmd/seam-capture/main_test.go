@@ -8,8 +8,6 @@ import (
 	"testing"
 )
 
-// TestSeamCaptureCLIRejectsInvalidConfig runs the built capture binary with
-// malformed configuration and requires a non-zero exit naming the variable.
 func TestSeamCaptureCLIRejectsInvalidConfig(t *testing.T) {
 	bin := buildBinary(t)
 	cases := []struct {
@@ -46,7 +44,6 @@ func buildBinary(t *testing.T) string {
 	return bin
 }
 
-// repoRoot walks up from the test working directory to the module root.
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	dir, err := os.Getwd()

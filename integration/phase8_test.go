@@ -200,5 +200,4 @@ func TestPhase8_ResourceBoundsAndTelemetry(t *testing.T) {
 		t.Fatalf("expected %d destination rows, got %d", rowCount, destRows)
 	}
 
-	fmt.Println("Phase 8 resource bounds and telemetry verified")
 }

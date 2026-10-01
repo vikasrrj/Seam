@@ -118,7 +118,6 @@ func TestPhase5_CrashAfterChunkRead(t *testing.T) {
 		t.Fatalf("discover chunks: %v", err)
 	}
 
-	// First attempt: start seam, let it read the chunk, then crash.
 	recCtx1, recCancel1 := context.WithCancel(ctx)
 	consumer1, err := kafka.NewConsumer(itest.KafkaBrokers(), itest.KafkaTopic(), cp.NextKafkaOffset, func(data []byte) (model.Change, error) {
 		var codec capture.JSONCodec
@@ -152,7 +151,6 @@ func TestPhase5_CrashAfterChunkRead(t *testing.T) {
 		t.Fatalf("failpoint did not trigger: %v", err)
 	}
 
-	// Simulate crash: stop reconciler without resuming the failpoint.
 	recCancel1()
 	select {
 	case err := <-recErr1:
@@ -165,7 +163,6 @@ func TestPhase5_CrashAfterChunkRead(t *testing.T) {
 	consumer1.Close()
 	time.Sleep(2 * time.Second)
 
-	// Recover: load checkpoint and bump attempt.
 	result, err := recovery.Recover(ctx, cpStore, jobCfg.JobID, jobCfg.SourceDSN)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
@@ -177,7 +174,6 @@ func TestPhase5_CrashAfterChunkRead(t *testing.T) {
 		t.Fatalf("expected completed_through to stay at %d, got %d", math.MinInt64, result.Checkpoint.CompletedThrough)
 	}
 
-	// Second attempt: resume from recovered checkpoint.
 	recCtx2, recCancel2 := context.WithCancel(ctx)
 	defer recCancel2()
 	consumer2, err := kafka.NewConsumer(itest.KafkaBrokers(), itest.KafkaTopic(), result.Checkpoint.NextKafkaOffset, func(data []byte) (model.Change, error) {
@@ -205,7 +201,6 @@ func TestPhase5_CrashAfterChunkRead(t *testing.T) {
 		recErr2 <- rec2.Run(recCtx2)
 	}()
 
-	// Verify the chunk completes.
 	dst, err := itest.DestConn(ctx)
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
@@ -244,5 +239,4 @@ func TestPhase5_CrashAfterChunkRead(t *testing.T) {
 		t.Fatal("second reconciler did not stop")
 	}
 
-	fmt.Println("Phase 5 crash recovery verified")
 }

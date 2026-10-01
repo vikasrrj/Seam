@@ -212,7 +212,6 @@ func TestPhase3_ReconciledUpdate(t *testing.T) {
 	if owner != "vikas" {
 		t.Fatalf("expected vikas, got %q", owner)
 	}
-	fmt.Println("Phase 3 reconciled update verified: CDC value preserved")
 }
 
 // TestPhase3_ReconciledDelete proves a concurrent delete is not resurrected.
@@ -252,7 +251,6 @@ func TestPhase3_ReconciledDelete(t *testing.T) {
 	if exists {
 		t.Fatal("expected row 3 to remain deleted")
 	}
-	fmt.Println("Phase 3 reconciled delete verified: delete not resurrected")
 }
 
 // TestPhase3_UnrelatedCDCEvent proves CDC events for keys outside the chunk
@@ -288,7 +286,6 @@ func TestPhase3_UnrelatedCDCEvent(t *testing.T) {
 	}
 	itest.CloseOnCleanup(t, "destination connection", dst)
 
-	// Candidate rows in [0,4] should be present with original values.
 	for i := int64(1); i <= 4; i++ {
 		var owner string
 		if err := dst.QueryRow(ctx, `SELECT owner FROM accounts WHERE id = $1`, i).Scan(&owner); err != nil {
@@ -299,7 +296,6 @@ func TestPhase3_UnrelatedCDCEvent(t *testing.T) {
 		}
 	}
 
-	// The unrelated update must still be applied.
 	var owner string
 	if err := dst.QueryRow(ctx, `SELECT owner FROM accounts WHERE id = 7`).Scan(&owner); err != nil {
 		t.Fatalf("read unrelated row: %v", err)
@@ -307,5 +303,4 @@ func TestPhase3_UnrelatedCDCEvent(t *testing.T) {
 	if owner != "seven-updated" {
 		t.Fatalf("expected seven-updated, got %q", owner)
 	}
-	fmt.Println("Phase 3 unrelated CDC event verified: candidates preserved, unrelated update applied")
 }

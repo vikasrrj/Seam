@@ -573,7 +573,6 @@ func TestReconciler_ConcurrentUpdateNotOverwritten(t *testing.T) {
 		t.Fatalf("run reconciler: %v", err)
 	}
 
-	// Candidate 2 was evicted and the CDC update applied.
 	ids := sink.survivorIDs()
 	if contains(ids, 2) {
 		t.Fatalf("expected id 2 to be evicted from snapshot, survivors=%v", ids)
@@ -635,7 +634,6 @@ func TestReconciler_ConcurrentInsertInChunkRange(t *testing.T) {
 		t.Fatalf("run reconciler: %v", err)
 	}
 
-	// Inserted row was not a candidate; it is applied via CDC.
 	changes := sink.changes()
 	if len(changes) != 1 || rowID(changes[0].Row) != 2 {
 		t.Fatalf("expected CDC insert to be applied, changes=%v", changes)
@@ -688,14 +686,12 @@ func TestReconciler_ChunkRetryIsIdempotent(t *testing.T) {
 	batches0 := [][]kafka.Record{chunkBatch("test-job", "gen:0:attempt:0", chunk, update)}
 	cfg, sink, cpStore, _ := setup(rows, 10, batches0)
 
-	// First run completes the chunk.
 	if err := runReconciler(t, cfg, 5*time.Second); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
 	firstSurvivors := sink.survivorIDs()
 	firstChanges := sink.changes()
 
-	// Reset state and reprocess with a new attempt using new markers.
 	sink.applied = nil
 	sink.survivors = nil
 	cpStore.checkpoints = nil
@@ -767,7 +763,6 @@ func crashInject(t *testing.T, rows map[int64]model.Row, chunkSize int, fpName f
 		t.Fatalf("failpoint did not trigger: %v", err)
 	}
 
-	// Simulate crash.
 	cancel()
 	select {
 	case err := <-recErr:
@@ -825,7 +820,6 @@ func TestReconciler_DuplicateCDCEventNotCorrupt(t *testing.T) {
 		2: account(2, "two", 200),
 	}
 	chunk := model.ChunkRange{Min: 1, Max: 2}
-	// Same source transaction delivered twice.
 	dup := accChange(model.OpUpdate, 2, "two-updated", 250)
 	dup.Source.LSN = "lsn-dup"
 	batches := [][]kafka.Record{
@@ -844,7 +838,6 @@ func TestReconciler_DuplicateCDCEventNotCorrupt(t *testing.T) {
 		t.Fatalf("run reconciler: %v", err)
 	}
 
-	// The duplicate batch should be consumed (otherwise Poll would block).
 	if consumer.remaining() != 0 {
 		t.Fatalf("expected all batches consumed, got %d remaining", consumer.remaining())
 	}
@@ -1044,7 +1037,6 @@ func TestReconciler_CDCAfterHighAppliesLater(t *testing.T) {
 		t.Fatalf("run reconciler: %v", err)
 	}
 
-	// Survivors include id 1 because the update happened after HIGH.
 	survivors := sink.survivorIDs()
 	if !contains(survivors, 1) {
 		t.Fatalf("expected id 1 to survive (update after HIGH), survivors=%v", survivors)

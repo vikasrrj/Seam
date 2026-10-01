@@ -186,7 +186,7 @@ func (c *coord) workerLoop(ctx context.Context, workerID string) error {
 		}
 		chunk.Attempt = c.attempt
 		chunk.WorkerID = workerID
-		// A chunk whose lease expired was safely reassigned to this worker —
+		// A chunk whose lease expired was safely reassigned to this worker,
 		// but only if no live window is still executing it. Two workers on the
 		// same window would push a second LOW/HIGH marker pair for the same
 		// range, so refuse loudly instead of corrupting the window.

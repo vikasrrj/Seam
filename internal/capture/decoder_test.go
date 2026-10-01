@@ -113,12 +113,10 @@ func TestDecoderBoundedTransactionEvents(t *testing.T) {
 			t.Fatalf("handle insert %d: %v", i, err)
 		}
 	}
-	// The sixth event must be rejected: the in-flight buffer is bounded.
 	_, err := d.Handle(insertAccount(99, "o", 1))
 	if !errors.Is(err, ErrTransactionTooLarge) {
 		t.Fatalf("expected ErrTransactionTooLarge, got %v", err)
 	}
-	// The decoder is not wedged: it still remembers the buffered transaction.
 	tx, err := d.Handle(commitMessage(10, "0/500", "0/501"))
 	if err != nil {
 		t.Fatalf("commit: %v", err)

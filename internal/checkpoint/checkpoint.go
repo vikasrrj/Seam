@@ -177,11 +177,9 @@ func (s *Store) EnsureTables(ctx context.Context) error {
 		);
 		CREATE INDEX IF NOT EXISTS seam_candidates_survivors_idx
 			ON seam_candidates(job_id, attempt, chunk_min_id) WHERE evicted = FALSE;
-		-- Migrate pre-Phase-1 candidates (fixed owner/balance_cents columns) to
-		-- the generic canonical-text payload. The row migration is conditional
-		-- in Go: the legacy columns only exist on databases created before
-		-- Phase 1. The payload column itself is additive so both shapes coexist
-		-- until the migration runs.
+		-- Migrate legacy candidates with fixed owner and balance columns to the
+		-- generic payload. The row migration is conditional because fresh
+		-- databases never had the legacy columns.
 		ALTER TABLE seam_candidates ADD COLUMN IF NOT EXISTS payload JSONB;
 		CREATE TABLE IF NOT EXISTS seam_route_fence (
 			id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),

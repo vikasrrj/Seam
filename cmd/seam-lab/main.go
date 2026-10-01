@@ -103,7 +103,6 @@ func staleUpdate(ctx context.Context, sourceDSN, destDSN, table string) error {
 		}
 	}
 
-	// Read the first row as canonical cells.
 	pkOrd := descriptor.PKOrdinal - 1
 	pkName := descriptor.PKColumn().Name
 	srcRows, err := src.Query(ctx, fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT 1",
@@ -158,15 +157,13 @@ func staleUpdate(ctx context.Context, sourceDSN, destDSN, table string) error {
 	}
 	col := descriptor.Columns[changed]
 
-	// Advance the source row to the stale value.
 	if _, err := src.Exec(ctx, fmt.Sprintf("UPDATE %s SET %s = ($1::text)::%s WHERE %s = ($2::text)::%s",
 		descriptor.SQLTable(), col.Name, schema.SupportedTypes[col.TypeOID], pkName, schema.SupportedTypes[descriptor.Columns[pkOrd].TypeOID]),
 		stale, cellString(cells[pkOrd])); err != nil {
 		return fmt.Errorf("update source: %w", err)
 	}
 
-	// Copy the now-stale source row directly to destination (simulates a naive
-	// snapshot write that races with CDC).
+	// Simulate a snapshot write racing with CDC.
 	values := make([]any, len(descriptor.Columns))
 	for i := range descriptor.Columns {
 		if i == changed {

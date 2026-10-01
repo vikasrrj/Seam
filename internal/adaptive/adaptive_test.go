@@ -14,7 +14,6 @@ func TestSuggestInitial(t *testing.T) {
 
 func TestObserveFastChunkGrowsSize(t *testing.T) {
 	s := NewSizer(10*time.Second, 1000, 10, 100000)
-	// Three very fast chunks: observed << target, so the size must grow.
 	for i := 0; i < 3; i++ {
 		s.Observe(10*time.Millisecond, 1000)
 	}
@@ -35,18 +34,15 @@ func TestObserveSlowChunkShrinksSize(t *testing.T) {
 
 func TestClamps(t *testing.T) {
 	s := NewSizer(10*time.Second, 500, 100, 200)
-	// initialSize 500 gets clamped into [100, 200] at construction.
 	if got := s.Suggest(); got != 200 {
 		t.Fatalf("construction clamp = %d, want 200", got)
 	}
-	// Very slow chunks push toward the minimum but never below it.
 	for i := 0; i < 20; i++ {
 		s.Observe(time.Hour, 200)
 	}
 	if got := s.Suggest(); got != 100 {
 		t.Fatalf("lower clamp = %d, want 100", got)
 	}
-	// Very fast chunks push toward the maximum but never above it.
 	for i := 0; i < 20; i++ {
 		s.Observe(time.Nanosecond, 200)
 	}

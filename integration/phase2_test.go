@@ -187,7 +187,6 @@ func TestPhase2_NaiveStaleUpdate(t *testing.T) {
 	}
 	itest.CloseOnCleanup(t, "destination connection", dst)
 
-	// Wait for CDC to apply the update.
 	for i := 0; i < 40; i++ {
 		var owner string
 		if err := dst.QueryRow(ctx, `SELECT owner FROM accounts WHERE id = 3`).Scan(&owner); err == nil && owner == "vikas" {
@@ -196,10 +195,8 @@ func TestPhase2_NaiveStaleUpdate(t *testing.T) {
 		time.Sleep(250 * time.Millisecond)
 	}
 
-	// Resume the naive snapshot.
 	resume()
 
-	// Wait for the chunk to complete.
 	for i := 0; i < 40; i++ {
 		var completed int64
 		if err := dst.QueryRow(ctx, `SELECT completed_through_id FROM seam_checkpoints WHERE job_id = $1`, jobID).Scan(&completed); err == nil && completed >= 4 {
@@ -216,7 +213,6 @@ func TestPhase2_NaiveStaleUpdate(t *testing.T) {
 	if owner != "owner-3" {
 		t.Fatalf("expected stale value owner-3, got %q", owner)
 	}
-	fmt.Println("Phase 2 stale update reproduced: naive snapshot overwrote concurrent update")
 	_ = cpStore
 }
 
@@ -248,7 +244,6 @@ func TestPhase2_NaiveDeleteResurrection(t *testing.T) {
 	}
 	itest.CloseOnCleanup(t, "destination connection", dst)
 
-	// Wait for CDC to apply the delete.
 	for i := 0; i < 40; i++ {
 		var exists bool
 		if err := dst.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM accounts WHERE id = 3)`).Scan(&exists); err == nil && !exists {
@@ -257,10 +252,8 @@ func TestPhase2_NaiveDeleteResurrection(t *testing.T) {
 		time.Sleep(250 * time.Millisecond)
 	}
 
-	// Resume the naive snapshot.
 	resume()
 
-	// Wait for the chunk to complete.
 	for i := 0; i < 40; i++ {
 		var completed int64
 		if err := dst.QueryRow(ctx, `SELECT completed_through_id FROM seam_checkpoints WHERE job_id = $1`, jobID).Scan(&completed); err == nil && completed >= 4 {
@@ -277,6 +270,5 @@ func TestPhase2_NaiveDeleteResurrection(t *testing.T) {
 	if !exists {
 		t.Fatal("expected row 3 to be resurrected by naive snapshot")
 	}
-	fmt.Println("Phase 2 delete resurrection reproduced: naive snapshot recreated deleted row")
 	_ = cpStore
 }

@@ -22,17 +22,8 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// TestPhase0_CDCFlow proves source changes reach the destination via Kafka,
-// transition by transition, and that the durable Kafka checkpoint advances.
-//
-// The scenario is structured so the initial backfill can never explain the
-// observed writes: source rows 1..3 are seeded before the job is created (they
-// arrive via the scan path), and the CDC mutations use id=5, which is outside
-// the [1..3] backfill manifest after the manifest is exhausted. Every change to
-// id=5 at the destination must therefore have flowed capture → Kafka → sink.
-//
-// Each step uses bounded polling with failure diagnostics that report the last
-// observed state; nothing relies on an unconditional sleep.
+// TestPhase0_CDCFlow verifies insert, update, and delete delivery through Kafka.
+// ID 5 is outside the backfill manifest, so its changes can only arrive by CDC.
 func TestPhase0_CDCFlow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -41,8 +32,6 @@ func TestPhase0_CDCFlow(t *testing.T) {
 		t.Fatalf("reset tables: %v", err)
 	}
 
-	// Seed the source before capture and the job exist, so rows 1..3 are
-	// reachable only through the backfill scan.
 	src, err := itest.SourceConn(ctx)
 	if err != nil {
 		t.Fatalf("source conn: %v", err)
@@ -54,7 +43,6 @@ func TestPhase0_CDCFlow(t *testing.T) {
 		}
 	}
 
-	// Start the capture reader.
 	readerCfg := capture.ReaderConfig{
 		SQLDSN:         itest.SourceDSN(),
 		ReplicationDSN: itest.SourceReplDSN(),
@@ -81,8 +69,6 @@ func TestPhase0_CDCFlow(t *testing.T) {
 		close(capErr)
 	}()
 
-	// Start the seam reconciler. There is no durable chunk store, so it runs
-	// the legacy scan loop and then CDC-only mode.
 	jobCfg := model.JobConfig{
 		JobID:             itest.JobID("phase0"),
 		SourceDSN:         itest.SourceDSN(),
@@ -149,9 +135,6 @@ func TestPhase0_CDCFlow(t *testing.T) {
 	}
 	itest.CloseOnCleanup(t, "destination connection", dst)
 
-	// Baseline: the seeded rows reach the destination through the backfill.
-	// This proves capture, the marker stream, and the sink are all live before
-	// any CDC mutation is issued.
 	waitForRow(ctx, t, dst, 1, "seed-1", 100, "initial backfill")
 	waitForRow(ctx, t, dst, 3, "seed-3", 300, "initial backfill")
 
@@ -167,24 +150,20 @@ func TestPhase0_CDCFlow(t *testing.T) {
 		t.Fatal("baseline checkpoint disappeared")
 	}
 
-	// Transition 1: insert. The exact row and values must appear.
 	if _, err := src.Exec(ctx, `INSERT INTO accounts (id, owner, balance_cents) VALUES (5, 'vik', 100)`); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	waitForRow(ctx, t, dst, 5, "vik", 100, "insert via CDC")
 
-	// Transition 2: update. The updated values must appear.
 	if _, err := src.Exec(ctx, `UPDATE accounts SET owner = 'vikas', balance_cents = 250 WHERE id = 5`); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	waitForRow(ctx, t, dst, 5, "vikas", 250, "update via CDC")
 
-	// Transition 3: delete. The row must disappear, and only that row.
 	if _, err := src.Exec(ctx, `DELETE FROM accounts WHERE id = 5`); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	waitForRowGone(ctx, t, dst, 5, "delete via CDC")
-	// The delete must not have disturbed the backfilled rows.
 	waitForRow(ctx, t, dst, 2, "seed-2", 200, "seeded row after delete")
 
 	// Both durable frontiers must advance past the baselines captured before
@@ -205,7 +184,6 @@ func TestPhase0_CDCFlow(t *testing.T) {
 		t.Fatal("reconciler did not stop")
 	}
 
-	// Force the capture connection closed so the reader goroutine exits.
 	_ = reader.Close()
 	select {
 	case err := <-capErr:
@@ -216,7 +194,6 @@ func TestPhase0_CDCFlow(t *testing.T) {
 		t.Fatal("capture reader did not stop")
 	}
 
-	fmt.Println("Phase 0 CDC flow verified")
 }
 
 func waitForCheckpointAdvance(ctx context.Context, t *testing.T, store *checkpoint.Store, jobID string, baseline int64) int64 {
@@ -242,8 +219,6 @@ func waitForCheckpointAdvance(ctx context.Context, t *testing.T, store *checkpoi
 	}
 }
 
-// waitForRow polls until the destination row has exactly the wanted values.
-// On timeout it reports the last observed state.
 func waitForRow(ctx context.Context, t *testing.T, dst *pgx.Conn, id int64, wantOwner string, wantBalance int64, what string) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
@@ -271,7 +246,6 @@ func waitForRow(ctx context.Context, t *testing.T, dst *pgx.Conn, id int64, want
 	}
 }
 
-// waitForRowGone polls until the destination row disappears.
 func waitForRowGone(ctx context.Context, t *testing.T, dst *pgx.Conn, id int64, what string) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
@@ -290,7 +264,6 @@ func waitForRowGone(ctx context.Context, t *testing.T, dst *pgx.Conn, id int64, 
 	}
 }
 
-// slotFlushLSN reads the capture slot's durable confirmed flush position.
 func slotFlushLSN(ctx context.Context, t *testing.T) (pglogrepl.LSN, error) {
 	t.Helper()
 	src, err := itest.SourceConn(ctx)
@@ -305,7 +278,6 @@ func slotFlushLSN(ctx context.Context, t *testing.T) (pglogrepl.LSN, error) {
 	return pglogrepl.ParseLSN(lsnText)
 }
 
-// waitSlotLSN returns the current slot flush LSN once the slot exists.
 func waitSlotLSN(ctx context.Context, t *testing.T) pglogrepl.LSN {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)

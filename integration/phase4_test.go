@@ -146,7 +146,6 @@ func TestPhase4_DurableCheckpoint(t *testing.T) {
 	}
 	fp.Resume(failpoint.AfterChunkReadBeforeReconciliation)
 
-	// Wait for chunk to complete and backfill to finish.
 	dst, err := itest.DestConn(ctx)
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
@@ -167,7 +166,6 @@ func TestPhase4_DurableCheckpoint(t *testing.T) {
 		t.Fatalf("backfill did not complete: completed_through=%d upper_bound=%d", completed, upperBound)
 	}
 
-	// Verify checkpoint metadata.
 	var nextOffset int64
 	var lastLSN *string
 	if err := dst.QueryRow(ctx, `SELECT next_kafka_offset, last_applied_lsn FROM seam_checkpoints WHERE job_id = $1`, jobCfg.JobID).Scan(&nextOffset, &lastLSN); err != nil {
@@ -180,7 +178,6 @@ func TestPhase4_DurableCheckpoint(t *testing.T) {
 		t.Fatal("expected last_applied_lsn to be set")
 	}
 
-	// Verify applied transactions were deduped.
 	var appliedCount int
 	if err := dst.QueryRow(ctx, `SELECT COUNT(*) FROM seam_applied_txs WHERE job_id = $1`, jobCfg.JobID).Scan(&appliedCount); err != nil {
 		t.Fatalf("count applied txs: %v", err)
@@ -200,5 +197,4 @@ func TestPhase4_DurableCheckpoint(t *testing.T) {
 		t.Fatal("reconciler did not stop")
 	}
 
-	fmt.Println("Phase 4 durable checkpoint verified")
 }

@@ -126,7 +126,6 @@ func TestPhase1_BoundedSnapshot(t *testing.T) {
 		recErr <- rec.Run(recCtx)
 	}()
 
-	// Wait for backfill to finish (completed_through reaches upper_bound).
 	dst, err := itest.DestConn(ctx)
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
@@ -147,7 +146,6 @@ func TestPhase1_BoundedSnapshot(t *testing.T) {
 		t.Fatalf("backfill did not complete: completed_through=%d upper_bound=%d", completed, upperBound)
 	}
 
-	// Verify every source row is present in destination.
 	var count int
 	if err := dst.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&count); err != nil {
 		t.Fatalf("count dest: %v", err)
@@ -186,5 +184,4 @@ func TestPhase1_BoundedSnapshot(t *testing.T) {
 		t.Fatal("capture reader did not stop")
 	}
 
-	fmt.Println("Phase 1 bounded snapshot verified")
 }

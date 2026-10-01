@@ -45,7 +45,6 @@ func TestPhase7_SourceReplayDedupe(t *testing.T) {
 		}
 	}
 
-	// Apply a concurrent update so there is CDC to replay.
 	if _, err := src.Exec(ctx, `UPDATE accounts SET balance_cents = 9999 WHERE id = 1`); err != nil {
 		t.Fatalf("update: %v", err)
 	}
@@ -145,7 +144,6 @@ func TestPhase7_SourceReplayDedupe(t *testing.T) {
 		recErr <- rec.Run(recCtx)
 	}()
 
-	// Wait for backfill to complete.
 	dst, err := itest.DestConn(ctx)
 	if err != nil {
 		t.Fatalf("dest conn: %v", err)
@@ -189,7 +187,6 @@ func TestPhase7_SourceReplayDedupe(t *testing.T) {
 		t.Fatal("reconciler did not stop")
 	}
 
-	// Replay from offset 0 with a fresh consumer and reconciler.
 	cp, err = cpStore.LoadCheckpoint(ctx, jobCfg.JobID)
 	if err != nil {
 		t.Fatalf("load checkpoint: %v", err)
@@ -222,7 +219,6 @@ func TestPhase7_SourceReplayDedupe(t *testing.T) {
 		replayErr <- replayRec.Run(replayCtx)
 	}()
 
-	// Let it replay and catch up to the previous offset.
 	for i := 0; i < 60; i++ {
 		var offset int64
 		if err := dst.QueryRow(ctx, `SELECT next_kafka_offset FROM seam_checkpoints WHERE job_id = $1`, jobCfg.JobID).Scan(&offset); err != nil {
@@ -250,7 +246,6 @@ func TestPhase7_SourceReplayDedupe(t *testing.T) {
 		t.Fatalf("expected applied_txs count unchanged (%d), got %d", appliedBefore, appliedAfter)
 	}
 
-	// Destination row count should still be exactly 5.
 	var rowCount int
 	if err := dst.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&rowCount); err != nil {
 		t.Fatalf("count rows: %v", err)
@@ -269,5 +264,4 @@ func TestPhase7_SourceReplayDedupe(t *testing.T) {
 		t.Fatal("replay reconciler did not stop")
 	}
 
-	fmt.Println("Phase 7 source replay dedupe verified")
 }

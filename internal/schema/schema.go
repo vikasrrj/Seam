@@ -233,7 +233,6 @@ func loadFromConn(ctx context.Context, conn Querier, namespace, table string, re
 		return nil, fmt.Errorf("%s.%s has no columns", namespace, table)
 	}
 
-	// Resolve the primary key constraint.
 	var pkName string
 	pkCols, err := primaryKeyColumns(ctx, conn, namespace, table)
 	if err != nil {
@@ -329,7 +328,6 @@ func ValidateIsomorphicDestination(ctx context.Context, conn Querier, source *Sc
 	if err != nil {
 		return fmt.Errorf("destination %s.%s: %w", "public", destTable, err)
 	}
-	// Destination replica identity is irrelevant: Seam writes full rows.
 	if len(dst.Columns) != len(source.Columns) {
 		return fmt.Errorf("destination %s.%s has %d columns; source %s has %d",
 			"public", destTable, len(dst.Columns), source.SQLTable(), len(source.Columns))

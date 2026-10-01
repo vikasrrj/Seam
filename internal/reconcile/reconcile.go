@@ -219,8 +219,8 @@ type Config struct {
 	// required: it pins the primary-key ordinal used for window indexing and
 	// the schema epoch every row change must carry.
 	SourceSchema *schema.Schema
-	// DisableEviction is a deliberately broken mode used by Phase 2 tests to
-	// demonstrate stale overwrite and delete resurrection.
+	// DisableEviction is used only by tests that reproduce stale overwrites and
+	// delete resurrection.
 	DisableEviction bool
 }
 
@@ -409,8 +409,8 @@ func (r *Reconciler) runChunkStoreLoop(ctx context.Context) error {
 // startHeartbeat renews the chunk lease on a fixed interval while the chunk is
 // being executed. It returns a stop function that should be called once the
 // chunk finishes. Any heartbeat error is reported to report (when non-nil) as
-// soon as it happens — so a worker whose lease can no longer be renewed fails
-// loudly instead of scanning on a lease it is about to lose — and is also
+// soon as it happens, so a worker whose lease can no longer be renewed fails
+// loudly instead of scanning on a lease it is about to lose. It is also
 // returned by the stop function for callers that poll (sequential mode).
 func (r *Reconciler) startHeartbeat(ctx context.Context, chunk *model.Chunk, report func(error)) func() error {
 	if r.cfg.DisableHeartbeat || r.cfg.LeaseDuration <= 0 {
@@ -508,7 +508,6 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 		}
 	}
 
-	// 1. Write LOW marker.
 	lowID, err := r.marker.WriteLow(ctx, r.cfg.JobID, r.cp.Attempt, chunkRange)
 	if err != nil {
 		return fmt.Errorf("write low marker: %w", err)
@@ -517,7 +516,6 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 		return err
 	}
 
-	// 2. Read historical chunk into candidate map.
 	rows, err := r.readChunk(ctx, chunkRange.Min, chunkRange.Max)
 	if err != nil {
 		return fmt.Errorf("read chunk %s: %w", chunkRange, err)
@@ -553,7 +551,6 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 		return err
 	}
 
-	// 3. Write HIGH marker.
 	highID, err := r.marker.WriteHigh(ctx, r.cfg.JobID, r.cp.Attempt, chunkRange)
 	if err != nil {
 		return fmt.Errorf("write high marker: %w", err)
@@ -567,7 +564,6 @@ func (r *Reconciler) runChunk(ctx context.Context, chunk *model.Chunk) error {
 		}
 	}
 
-	// 4. Consume Kafka until HIGH is processed.
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -681,7 +677,6 @@ func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Re
 	state := w.state
 	w.mu.Unlock()
 
-	// Group records by source transaction.
 	groups := groupByTransaction(records)
 
 	for idx, group := range groups {
@@ -701,7 +696,6 @@ func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Re
 			}
 			continue
 		}
-		// Determine the effective window state for this group based on markers.
 		newState, err := r.evaluateMarkers(group, w)
 		if err != nil {
 			return false, err
@@ -748,8 +742,6 @@ func (r *Reconciler) processChunkRecords(ctx context.Context, records []kafka.Re
 			return true, nil
 		}
 
-		// Otherwise apply the source transaction normally, evicting candidates
-		// that are touched while inside the window.
 		if err := r.applySourceTransaction(ctx, group, w); err != nil {
 			return false, err
 		}
@@ -765,8 +757,6 @@ func (r *Reconciler) skipAlreadyCompletedGroup(group []kafka.Record) (bool, erro
 		if rec.Change.Marker != nil &&
 			rec.Change.Marker.JobID == r.cfg.JobID &&
 			rec.Change.Marker.Attempt == r.cp.Attempt {
-			// All markers of the current attempt for this chunk were consumed
-			// by completeChunk.
 			return true, nil
 		}
 	}
@@ -784,11 +774,9 @@ func (r *Reconciler) evaluateMarkers(group []kafka.Record, w *window) (WindowSta
 		}
 		marker := rec.Change.Marker
 		if marker.JobID != r.cfg.JobID || marker.Attempt != r.cp.Attempt {
-			// Stale marker from a previous attempt; ignore.
 			continue
 		}
 		if marker.ChunkMin != w.chunk.Min || marker.ChunkMax != w.chunk.Max {
-			// Marker for a different window; ignore.
 			continue
 		}
 		switch marker.Kind {
@@ -959,7 +947,6 @@ func (r *Reconciler) applyChange(ctx context.Context, tx pgx.Tx, change model.Ch
 		}
 		return r.sink.Apply(ctx, tx, change)
 	case change.Marker != nil:
-		// Markers carry no destination mutation.
 		return nil
 	default:
 		return fmt.Errorf("change has no payload")

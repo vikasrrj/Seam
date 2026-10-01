@@ -270,7 +270,7 @@ func benchBackfill(b *testing.B, bench backfillBenchConfig) {
 
 // verifyExactContents compares source and destination row-for-row in key order
 // after the benchmark, outside the timer. It detects missing rows, extra rows,
-// duplicates, reordered rows, and changed column values — not just a row count.
+// duplicates, reordered rows, and changed column values, not just a row count.
 func verifyExactContents(b *testing.B, ctx context.Context) {
 	b.Helper()
 	src, err := itest.SourceConn(ctx)
