@@ -161,13 +161,21 @@ does not silently skip data.
 |---|---|---|
 | PostgreSQL backfill | 100,000 rows, one worker | ~3,379 rows/s |
 | PostgreSQL backfill | 100,000 rows, four workers | ~6,717 rows/s (~1.99x wall clock) |
-| Snowflake snapshot (SQL loader) | 5,000 rows | ~188 rows/s |
+| Snowflake snapshot staging | 1,000 rows, one worker | ~305 rows/s |
+| Snowflake snapshot staging | 4,000 rows, four workers | ~794 rows/s (~2.60x scaling) |
+| Snowflake end-to-end backfill | 10,000 rows, 1,000-row chunks, four workers | 160.5 rows/s |
+| Snowflake end-to-end backfill | 10,000 rows, 5,000-row chunks, four workers | 498.6 rows/s (3.11x) |
+| Snowflake end-to-end backfill | 10,000 rows, one chunk, worker cap | 601.2 rows/s (3.75x) |
+| Snowflake end-to-end backfill | 10,000 rows, one chunk, marker procedure | ~671 rows/s (4.18x) |
 
 The PostgreSQL samples are an exact verified local pair, not a distribution, and
-are not evidence at millions or billions of rows. The Snowflake figure is a
-component measurement of candidate staging only. The bulk `COPY INTO` path is
-implemented and tested but has not been run against a live account, so no
-speedup is claimed from it. Raw results: [docs/benchmarks.md](docs/benchmarks.md).
+are not evidence at millions or billions of rows. The Snowflake figures include
+live-account component measurements and controlled end-to-end backfill
+comparisons. Every end-to-end result passed exact source-versus-shadow
+verification. The retained marker procedure also passed the intentional
+sink/worker crash, takeover, replay, validation, and promotion test. Validation
+and promotion remain outside the timed throughput window. Raw results and
+measurement limits: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Current limitations
 
@@ -180,6 +188,8 @@ measured.
 
 ## Documentation
 
+- [Technical report](docs/seam-report.md) - the system, decision flow,
+  performance evidence, present bottlenecks, and next work
 - [PostgreSQL operations](docs/operations.md) and
   [Snowflake operations](docs/snowflake.md) - running each destination path
 - [Generic row design](docs/generic-row-design.md) - schema and type contract

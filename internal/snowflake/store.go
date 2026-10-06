@@ -100,6 +100,7 @@ func (s *Store) EnsureObjects(ctx context.Context, initialOffset int64) error {
 	if s.cfg.SnapshotLoader == SnapshotLoaderBulk {
 		statements = append(statements, "CREATE STAGE IF NOT EXISTS "+s.cfg.internal("SNAPSHOT_FILES")+" FILE_FORMAT = (TYPE = JSON COMPRESSION = GZIP)")
 	}
+	statements = append(statements, createMarkerProcedureSQL(s.cfg))
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("initialize Snowflake objects: %w", err)
@@ -247,6 +248,25 @@ func (s *Store) ApplyTransaction(ctx context.Context, lease *SinkLease, transact
 		}
 		return nil
 	}
+	if rowCount == 0 && eventCount == 1 {
+		marker, err := singleMarker(transaction)
+		if err != nil {
+			return err
+		}
+		finishProcedure := startPhase(ctx, "cdc-marker-procedure-call")
+		err = s.applySingleMarker(ctx, tx, lease, transaction, sourceTx, fingerprint, eventCount, lsn, marker)
+		finishProcedure()
+		if err != nil {
+			return err
+		}
+		finishCommit := startPhase(ctx, "cdc-commit")
+		commitErr := tx.Commit()
+		finishCommit()
+		if commitErr != nil {
+			return fmt.Errorf("commit Snowflake marker transaction: %w", commitErr)
+		}
+		return nil
+	}
 	batchID := s.cfg.StreamID + ":" + sourceTx
 	if err := s.stageTransaction(ctx, tx, transaction, batchID, sourceTx, lsn); err != nil {
 		return err
@@ -318,6 +338,101 @@ func (s *Store) ApplyTransaction(ctx context.Context, lease *SinkLease, transact
 		return fmt.Errorf("commit Snowflake apply transaction: %w", commitErr)
 	}
 	return nil
+}
+
+func singleMarker(transaction *kafka.Transaction) (*model.Marker, error) {
+	var marker *model.Marker
+	err := transaction.Walk(func(records []kafka.Record) error {
+		for _, record := range records {
+			if record.Change.Marker == nil || record.Change.Row != nil || marker != nil {
+				return fmt.Errorf("source transaction %s is not a single-marker transaction", transaction.Source)
+			}
+			copy := *record.Change.Marker
+			marker = &copy
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if marker == nil {
+		return nil, fmt.Errorf("source transaction %s has no marker", transaction.Source)
+	}
+	return marker, nil
+}
+
+func (s *Store) applySingleMarker(ctx context.Context, tx *sql.Tx, lease *SinkLease, transaction *kafka.Transaction, sourceTx, fingerprint string, eventCount int, lsn uint64, marker *model.Marker) error {
+	if marker == nil {
+		return fmt.Errorf("nil Snowflake marker")
+	}
+	arguments := []any{
+		s.cfg.StreamID, marker.ID, string(marker.Kind), marker.JobID, marker.Attempt,
+		strconv.FormatInt(marker.ChunkMin, 10), strconv.FormatInt(marker.ChunkMax, 10), sourceTx,
+		strconv.FormatInt(transaction.FirstOffset, 10), strconv.FormatInt(transaction.FinalOffset, 10), strconv.FormatUint(lsn, 10),
+		strconv.Itoa(eventCount), fingerprint, lease.OwnerID, strconv.FormatInt(lease.Epoch, 10),
+		strconv.FormatInt(transaction.FirstOffset, 10), strconv.FormatInt(transaction.FinalOffset+1, 10),
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(arguments)), ",")
+	var status string
+	if err := tx.QueryRowContext(ctx, "CALL "+s.cfg.internal("APPLY_MARKER")+"("+placeholders+")", arguments...).Scan(&status); err != nil {
+		return fmt.Errorf("call Snowflake marker apply procedure: %w", err)
+	}
+	if status != "APPLIED" {
+		return fmt.Errorf("Snowflake marker apply procedure returned %q", status)
+	}
+	return nil
+}
+
+func createMarkerProcedureSQL(cfg Config) string {
+	routesSQL := strconv.Quote("SELECT ROUTE_ID, TARGET_TABLE FROM " + cfg.internal("ROUTES") + " WHERE STREAM_ID = ? AND ACTIVE = TRUE ORDER BY ROUTE_ID")
+	markerSQL := strconv.Quote("INSERT INTO " + cfg.internal("MARKERS") + " (STREAM_ID, MARKER_ID, KIND, JOB_ID, ATTEMPT, CHUNK_MIN, CHUNK_MAX, SOURCE_TX, FINAL_OFFSET, SOURCE_LSN) VALUES (?, ?, ?, ?, ?, TO_NUMBER(?), TO_NUMBER(?), ?, TO_NUMBER(?), TO_NUMBER(?))")
+	fenceSQL := strconv.Quote("UPDATE " + cfg.internal("SINK_LEASES") + " SET UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND OWNER_ID = ? AND OWNER_EPOCH = TO_NUMBER(?) AND LEASE_EXPIRES > CURRENT_TIMESTAMP()")
+	ledgerSQL := strconv.Quote("INSERT INTO " + cfg.internal("APPLIED_TRANSACTIONS") + " (STREAM_ID, SOURCE_TX, FIRST_OFFSET, FINAL_OFFSET, EVENT_COUNT, TX_FINGERPRINT) VALUES (?, ?, TO_NUMBER(?), TO_NUMBER(?), TO_NUMBER(?), ?)")
+	frontierSQL := strconv.Quote("UPDATE " + cfg.internal("OFFSETS") + " SET NEXT_OFFSET = TO_NUMBER(?), UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND NEXT_OFFSET = TO_NUMBER(?)")
+	return `CREATE OR REPLACE PROCEDURE ` + cfg.internal("APPLY_MARKER") + `(
+P_STREAM_ID VARCHAR, P_MARKER_ID VARCHAR, P_KIND VARCHAR, P_JOB_ID VARCHAR, P_ATTEMPT VARCHAR,
+P_CHUNK_MIN VARCHAR, P_CHUNK_MAX VARCHAR, P_SOURCE_TX VARCHAR, P_FIRST_OFFSET VARCHAR,
+P_FINAL_OFFSET VARCHAR, P_SOURCE_LSN VARCHAR, P_EVENT_COUNT VARCHAR, P_FINGERPRINT VARCHAR,
+P_OWNER_ID VARCHAR, P_OWNER_EPOCH VARCHAR, P_EXPECTED_OFFSET VARCHAR, P_NEXT_OFFSET VARCHAR)
+RETURNS VARCHAR NOT NULL LANGUAGE JAVASCRIPT EXECUTE AS CALLER AS $$
+function executeDML(sqlText, binds, expected, name) {
+  var statement = snowflake.createStatement({sqlText: sqlText, binds: binds});
+  statement.execute();
+  var affected = statement.getNumRowsAffected();
+  if (affected !== expected) {
+    throw new Error(name + " affected " + affected + " rows, expected " + expected);
+  }
+}
+var routes = snowflake.createStatement({
+  sqlText: ` + routesSQL + `,
+  binds: [P_STREAM_ID]
+}).execute();
+var routeCount = 0;
+while (routes.next()) {
+  var routeID = routes.getColumnValue(1);
+  var targetTable = routes.getColumnValue(2);
+  if (!/^[A-Za-z_][A-Za-z0-9_$]*$/.test(targetTable)) {
+    throw new Error("route " + routeID + " contains invalid target table " + targetTable);
+  }
+  routeCount++;
+}
+if (routeCount === 0) {
+  throw new Error("stream has no active target routes");
+}
+executeDML(
+  ` + markerSQL + `,
+  [P_STREAM_ID, P_MARKER_ID, P_KIND, P_JOB_ID, P_ATTEMPT, P_CHUNK_MIN, P_CHUNK_MAX, P_SOURCE_TX, P_FINAL_OFFSET, P_SOURCE_LSN], 1, "marker insert");
+executeDML(
+  ` + fenceSQL + `,
+  [P_STREAM_ID, P_OWNER_ID, P_OWNER_EPOCH], 1, "lease fence");
+executeDML(
+  ` + ledgerSQL + `,
+  [P_STREAM_ID, P_SOURCE_TX, P_FIRST_OFFSET, P_FINAL_OFFSET, P_EVENT_COUNT, P_FINGERPRINT], 1, "replay ledger insert");
+executeDML(
+  ` + frontierSQL + `,
+  [P_NEXT_OFFSET, P_STREAM_ID, P_EXPECTED_OFFSET], 1, "frontier compare-and-set");
+return "APPLIED";
+$$`
 }
 
 func classifyReplay(frontier int64, transaction *kafka.Transaction, eventCount int, fingerprint string, applied *appliedTransaction) (replayAction, error) {
@@ -641,6 +756,7 @@ func parseLSN(value string) (uint64, error) {
 // MarkerCommitted reports whether the sink has durably processed a marker.
 // The backfill coordinator uses this as the CDC catch-up boundary.
 func (s *Store) MarkerCommitted(ctx context.Context, markerID string) (bool, error) {
+	defer startPhase(ctx, "snapshot-marker-poll")()
 	var one int
 	err := s.db.QueryRowContext(ctx, "SELECT 1 FROM "+s.cfg.internal("MARKERS")+" WHERE STREAM_ID = ? AND MARKER_ID = ? LIMIT 1", s.cfg.StreamID, markerID).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -656,6 +772,7 @@ func (s *Store) MarkerCommitted(ctx context.Context, markerID string) (bool, err
 // polling control-plane operation; target correctness does not depend on the
 // polling interval.
 func (s *Store) WaitForMarker(ctx context.Context, markerID string, interval time.Duration) error {
+	defer startPhase(ctx, "snapshot-marker-wait")()
 	if interval <= 0 {
 		interval = time.Second
 	}

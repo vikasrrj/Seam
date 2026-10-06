@@ -306,6 +306,7 @@ func (s *Store) LoadBackfill(ctx context.Context, jobID string) (*BackfillJob, e
 // row-locking worker queue, so selection may race; only one contender can
 // advance the observed token and the losers retry.
 func (s *Store) LeaseChunk(ctx context.Context, jobID, attempt, workerID string, duration time.Duration) (*ChunkLease, error) {
+	defer startPhase(ctx, "snapshot-lease-chunk")()
 	if jobID == "" || attempt == "" || workerID == "" || duration <= 0 {
 		return nil, fmt.Errorf("job, attempt, worker, and positive lease duration are required")
 	}
@@ -363,6 +364,7 @@ func validateLease(lease *ChunkLease, streamID string) error {
 // BeginChunkScan records the LOW marker and resets any disposable snapshot
 // stage from a crashed prior owner of this logical range.
 func (s *Store) BeginChunkScan(ctx context.Context, lease *ChunkLease, lowMarkerID string) error {
+	defer startPhase(ctx, "snapshot-begin-scan-transaction")()
 	if err := validateLease(lease, s.cfg.StreamID); err != nil {
 		return err
 	}
@@ -477,6 +479,7 @@ func (s *Store) stageSnapshotSQL(ctx context.Context, lease *ChunkLease, rows []
 }
 
 func (s *Store) SealChunkScan(ctx context.Context, lease *ChunkLease, highMarkerID string) error {
+	defer startPhase(ctx, "snapshot-seal-scan")()
 	if err := validateLease(lease, s.cfg.StreamID); err != nil {
 		return err
 	}
@@ -501,28 +504,38 @@ func (s *Store) FinalizeChunk(ctx context.Context, lease *ChunkLease) error {
 	if err := validateLease(lease, s.cfg.StreamID); err != nil {
 		return err
 	}
+	finishBegin := startPhase(ctx, "snapshot-finalize-begin")
 	tx, err := s.db.BeginTx(ctx, nil)
+	finishBegin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var lowMarkerID, highMarkerID, routeID, shadowTable string
 	var rowsScanned int64
+	finishControlRead := startPhase(ctx, "snapshot-finalize-control-read")
 	err = tx.QueryRowContext(ctx, "SELECT C.LOW_MARKER_ID, C.HIGH_MARKER_ID, C.ROWS_SCANNED, J.SHADOW_ROUTE_ID, J.SHADOW_TABLE FROM "+s.cfg.internal("BACKFILL_CHUNKS")+" C JOIN "+s.cfg.internal("BACKFILL_JOBS")+" J ON J.STREAM_ID = C.STREAM_ID AND J.JOB_ID = C.JOB_ID AND J.ATTEMPT = C.ATTEMPT WHERE C.STREAM_ID = ? AND C.JOB_ID = ? AND C.ATTEMPT = ? AND C.CHUNK_MIN = ? AND C.CHUNK_MAX = ? AND C.LEASE_OWNER = ? AND C.LEASE_TOKEN = ? AND C.LEASE_EXPIRES > CURRENT_TIMESTAMP() AND C.STATE = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.Range.Max, lease.WorkerID, lease.LeaseToken, string(model.ChunkCommitting)).Scan(&lowMarkerID, &highMarkerID, &rowsScanned, &routeID, &shadowTable)
+	finishControlRead()
 	if err != nil {
 		return fmt.Errorf("validate Snowflake chunk finalization lease: %w", err)
 	}
 	var lowLSNText string
-	if err := tx.QueryRowContext(ctx, "SELECT SOURCE_LSN FROM "+s.cfg.internal("MARKERS")+" WHERE STREAM_ID = ? AND MARKER_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ? AND CHUNK_MAX = ?", s.cfg.StreamID, lowMarkerID, lease.JobID, lease.Attempt, lease.Range.Min, lease.Range.Max).Scan(&lowLSNText); err != nil {
-		return fmt.Errorf("LOW marker %q is not durably applied: %w", lowMarkerID, err)
+	finishLowRead := startPhase(ctx, "snapshot-finalize-low-marker-read")
+	lowReadErr := tx.QueryRowContext(ctx, "SELECT SOURCE_LSN FROM "+s.cfg.internal("MARKERS")+" WHERE STREAM_ID = ? AND MARKER_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ? AND CHUNK_MAX = ?", s.cfg.StreamID, lowMarkerID, lease.JobID, lease.Attempt, lease.Range.Min, lease.Range.Max).Scan(&lowLSNText)
+	finishLowRead()
+	if lowReadErr != nil {
+		return fmt.Errorf("LOW marker %q is not durably applied: %w", lowMarkerID, lowReadErr)
 	}
 	lowLSN, err := strconv.ParseUint(lowLSNText, 10, 64)
 	if err != nil {
 		return fmt.Errorf("LOW marker %q has invalid source LSN %q: %w", lowMarkerID, lowLSNText, err)
 	}
 	var highSeen int
-	if err := tx.QueryRowContext(ctx, "SELECT 1 FROM "+s.cfg.internal("MARKERS")+" WHERE STREAM_ID = ? AND MARKER_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ? AND CHUNK_MAX = ?", s.cfg.StreamID, highMarkerID, lease.JobID, lease.Attempt, lease.Range.Min, lease.Range.Max).Scan(&highSeen); err != nil {
-		return fmt.Errorf("HIGH marker %q is not durably applied: %w", highMarkerID, err)
+	finishHighRead := startPhase(ctx, "snapshot-finalize-high-marker-read")
+	highReadErr := tx.QueryRowContext(ctx, "SELECT 1 FROM "+s.cfg.internal("MARKERS")+" WHERE STREAM_ID = ? AND MARKER_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ? AND CHUNK_MAX = ?", s.cfg.StreamID, highMarkerID, lease.JobID, lease.Attempt, lease.Range.Min, lease.Range.Max).Scan(&highSeen)
+	finishHighRead()
+	if highReadErr != nil {
+		return fmt.Errorf("HIGH marker %q is not durably applied: %w", highMarkerID, highReadErr)
 	}
 	mergeSQL, err := mergeSnapshotSQL(s.cfg, s.schema, shadowTable)
 	if err != nil {
@@ -542,19 +555,30 @@ func (s *Store) FinalizeChunk(ctx context.Context, lease *ChunkLease) error {
 	// finalization in the same table-lock order: after MERGE has consumed the
 	// candidates, clear their stage rows before completing the chunk. All of
 	// these effects remain atomic and roll back together on a fencing failure.
-	if _, err := tx.ExecContext(ctx, "DELETE FROM "+s.cfg.internal("SNAPSHOT_STAGE")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min); err != nil {
-		return err
+	finishCleanup := startPhase(ctx, "snapshot-finalize-stage-cleanup")
+	_, cleanupErr := tx.ExecContext(ctx, "DELETE FROM "+s.cfg.internal("SNAPSHOT_STAGE")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min)
+	finishCleanup()
+	if cleanupErr != nil {
+		return cleanupErr
 	}
+	finishChunkUpdate := startPhase(ctx, "snapshot-finalize-chunk-update")
 	result, err = tx.ExecContext(ctx, "UPDATE "+s.cfg.internal("BACKFILL_CHUNKS")+" SET STATE = ?, LOW_LSN = ?, ROWS_APPLIED = ?, LEASE_EXPIRES = NULL, UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ? AND LEASE_OWNER = ? AND LEASE_TOKEN = ? AND LEASE_EXPIRES > CURRENT_TIMESTAMP() AND STATE = ?", string(model.ChunkCompleted), strconv.FormatUint(lowLSN, 10), rowsApplied, s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.WorkerID, lease.LeaseToken, string(model.ChunkCommitting))
+	finishChunkUpdate()
 	if err != nil {
 		return err
 	}
 	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
 		return fmt.Errorf("finalize Snowflake chunk %s: lease was fenced during merge", lease.Range)
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE "+s.cfg.internal("BACKFILL_JOBS")+" SET COMPLETED_CHUNKS = (SELECT COUNT(*) FROM "+s.cfg.internal("BACKFILL_CHUNKS")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND STATE = ?), STATE = IFF((SELECT COUNT(*) FROM "+s.cfg.internal("BACKFILL_CHUNKS")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND STATE <> ?) = 0, ?, STATE), UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND STATE = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, string(model.ChunkCompleted), s.cfg.StreamID, lease.JobID, lease.Attempt, string(model.ChunkCompleted), string(BackfillReadyToVerify), s.cfg.StreamID, lease.JobID, lease.Attempt, string(BackfillRunning)); err != nil {
-		return err
+	finishJobUpdate := startPhase(ctx, "snapshot-finalize-job-update")
+	_, jobUpdateErr := tx.ExecContext(ctx, "UPDATE "+s.cfg.internal("BACKFILL_JOBS")+" SET COMPLETED_CHUNKS = (SELECT COUNT(*) FROM "+s.cfg.internal("BACKFILL_CHUNKS")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND STATE = ?), STATE = IFF((SELECT COUNT(*) FROM "+s.cfg.internal("BACKFILL_CHUNKS")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND STATE <> ?) = 0, ?, STATE), UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND STATE = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, string(model.ChunkCompleted), s.cfg.StreamID, lease.JobID, lease.Attempt, string(model.ChunkCompleted), string(BackfillReadyToVerify), s.cfg.StreamID, lease.JobID, lease.Attempt, string(BackfillRunning))
+	finishJobUpdate()
+	if jobUpdateErr != nil {
+		return jobUpdateErr
 	}
 	_ = rowsScanned // persisted separately from warehouse MERGE's affected-row semantics
-	return tx.Commit()
+	finishCommit := startPhase(ctx, "snapshot-finalize-commit")
+	commitErr := tx.Commit()
+	finishCommit()
+	return commitErr
 }

@@ -128,11 +128,12 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		return fmt.Errorf("Snowflake backfill %q cannot run from state %s", c.cfg.JobID, job.State)
 	}
 
+	workerCount := min(c.cfg.Workers, len(job.Spec.Chunks))
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	errCh := make(chan error, c.cfg.Workers)
+	errCh := make(chan error, workerCount)
 	var workers sync.WaitGroup
-	for index := 0; index < c.cfg.Workers; index++ {
+	for index := 0; index < workerCount; index++ {
 		workers.Add(1)
 		workerID := fmt.Sprintf("%s-%d", c.cfg.WorkerID, index)
 		go func() {

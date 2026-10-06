@@ -89,6 +89,7 @@ type fakeWarehouse struct {
 	stageErr     error
 	heartbeatErr error
 	manifest     seamsnowflake.BackfillSpec
+	workerIDs    []string
 }
 
 func (warehouse *fakeWarehouse) PrepareBackfill(context.Context, string, string, string) (*seamsnowflake.BackfillJob, error) {
@@ -121,6 +122,7 @@ func (warehouse *fakeWarehouse) LeaseChunk(_ context.Context, jobID, attempt, wo
 	warehouse.log.add("lease")
 	warehouse.mu.Lock()
 	defer warehouse.mu.Unlock()
+	warehouse.workerIDs = append(warehouse.workerIDs, workerID)
 	if warehouse.leaseGiven {
 		return nil, nil
 	}
@@ -129,6 +131,32 @@ func (warehouse *fakeWarehouse) LeaseChunk(_ context.Context, jobID, attempt, wo
 		StreamID: "stream", JobID: jobID, Attempt: attempt, WorkerID: workerID, LeaseToken: 1,
 		Range: model.ChunkRange{Min: math.MinInt64, Max: 10},
 	}, nil
+}
+
+func TestCoordinatorCapsWorkersAtManifestSize(t *testing.T) {
+	log := &callLog{}
+	warehouse := &fakeWarehouse{log: log}
+	scanner := &fakeScanner{
+		log: log, upper: 10, pages: []model.ChunkRange{{Min: 1, Max: 10}},
+		rows: []model.Row{{Values: []model.Value{model.Int64Value(1)}}},
+	}
+	coordinator, err := New(Config{
+		JobID: "job", Attempt: "attempt", ShadowTable: "ACCOUNTS_SHADOW", ChunkSize: 100,
+		Workers: 4, WorkerID: "worker", Lease: time.Second, Heartbeat: 500 * time.Millisecond, Poll: time.Millisecond,
+	}, warehouse, scanner, &fakeMarkers{log: log})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	warehouse.mu.Lock()
+	defer warehouse.mu.Unlock()
+	for _, workerID := range warehouse.workerIDs {
+		if workerID != "worker-0" {
+			t.Fatalf("one-chunk manifest started extra worker %q; calls=%v", workerID, warehouse.workerIDs)
+		}
+	}
 }
 
 func (warehouse *fakeWarehouse) RenewChunkLease(context.Context, *seamsnowflake.ChunkLease, time.Duration) error {

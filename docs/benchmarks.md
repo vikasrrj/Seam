@@ -1,316 +1,127 @@
-# Backfill benchmark
+# Benchmarks
 
-## Current implementation smoke samples
+All reported backfill runs compare source and destination rows after the timer.
+The Snowflake numbers use a live account. Validation and promotion are not part
+of the timed backfill window.
 
-After adding durable candidate staging, disk-backed streamed transaction
-apply, capture fencing, process-shared resource admission, and exact-prefix
-promotion, two fresh-process smoke samples were executed with the same
-10,000-row, 1,000-row-chunk workload. The benchmark now wires the production
-resource controller and PostgreSQL advisory permit pools. Both samples passed
-the benchmark's exact row-for-row verification:
+## Results
 
-| Workers | ns/op | rows/s | Discovery | Reconciliation |
+| Path | Rows | Workers | Wall time | Throughput |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 3,086,367,536 | 3,240 | 229 ms | 2,743 ms |
-| 4 | 1,436,515,096 | 6,961 | 222 ms | 1,117 ms |
+| PostgreSQL backfill | 100,000 | 1 | 29.59 s | 3,379 rows/s |
+| PostgreSQL backfill | 100,000 | 4 | 14.89 s | 6,717 rows/s |
+| Snowflake bulk staging | 1,000 | 1 | 3.278 s | 305.1 rows/s |
+| Snowflake bulk staging | 4,000 | 4 | 5.036 s | 794.3 rows/s |
 
-The latest single pair is a **2.15× wall-clock speedup**, not a distribution.
-Earlier post-staging smoke pairs bypassed the production resource controller,
-so their ratios are not comparable to this corrected pair. Durable staging
-adds destination writes and made both absolute results slower than the earlier
-in-memory-window samples below, while four workers hid more of that latency.
-Run the corrected counterbalanced script again before drawing a performance
-conclusion.
+The PostgreSQL pair used 1,000-row chunks and a 16-byte payload. Raw matrix
+output is in `docs/benchmark-matrix-100k.tsv`.
 
-A separate fresh-process 100,000-row pair used the same 16-byte payload and
-1,000-row chunks, with production resource admission and exact verification:
+The Snowflake staging rows used a 96-byte payload on an X-Small warehouse. The
+older SQL loader took 6.237 seconds for 1,000 rows. The bulk loader writes gzip
+JSON, uploads it with `PUT`, and loads it with `COPY INTO`.
 
-| Rows | Workers | Wall time | rows/s | Discovery | Reconciliation | Speedup |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100,000 | 1 | 29.59 s | 3,379 | 2.07 s | 27.42 s | 1.00× |
-| 100,000 | 4 | 14.89 s | 6,717 | 2.23 s | 12.54 s | 1.99× |
+## Snowflake end to end
 
-This is also one pair, not a distribution. Similar throughput at 10,000 and
-100,000 rows suggests startup cost is not the dominant limit on this host;
-the result does not identify whether source I/O, candidate staging,
-destination apply, or shared-host contention is the first saturated resource.
-The structured raw output is retained in `docs/benchmark-matrix-100k.tsv`.
+These runs used 10,000 rows, four configured workers, a 250 ms marker poll, and
+exact source-to-shadow verification.
 
-`BenchmarkBackfillConfigured` and `scripts/bench-matrix.sh` now run each matrix
-cell in a fresh process and vary row count, row width, worker count, and chunk
-size. The default matrix is intentionally a local-workstation suite; larger
-runs can be selected with `ROWS_LIST`, `OWNER_BYTES_LIST`, `WORKERS_LIST`, and
-`CHUNK_LIST`. Output is retained as TSV and every cell still performs exact
-content verification outside the timer.
+| Change | Chunks | Markers | Wall time | Throughput |
+| --- | ---: | ---: | ---: | ---: |
+| 1,000-row chunks | 10 | 20 | 62.316 s | 160.5 rows/s |
+| 5,000-row chunks | 2 | 4 | 20.055 s | 498.6 rows/s |
+| One chunk | 1 | 2 | 19.203 s | 520.8 rows/s |
+| Cap workers to chunk count | 1 | 2 | 16.632 s | 601.2 rows/s |
+| Apply markers with one procedure call | 1 | 2 | 14.901 s median | about 671 rows/s |
 
-## Earlier in-memory-window counterbalanced run
+The last row is the median of two runs: 14.789 and 15.012 seconds. It is 10.4%
+faster than the worker-cap result. The procedure keeps the existing transaction,
+lease fence, replay ledger, and frontier compare-and-set.
 
-This documents an executed, corrected run of the counterbalanced backfill
-benchmark against the dedicated integration stack
-(`integration/docker-compose.yml`, host ports 5435/5436/9094). It reports only
-what was run; it does not extrapolate to larger workloads.
+Latest Snowflake phase times:
 
-### What it measures
+| Phase | Time |
+| --- | ---: |
+| Two marker transactions | 5.854 s median |
+| Finalization | 2.759-3.241 s |
+| COPY transaction | 1.679-1.700 s |
+| PUT | 0.980-1.739 s |
 
-`BenchmarkBackfillWorkers1` and `BenchmarkBackfillWorkers4` (in
-`integration/bench_test.go`) seed a fresh 10,000-row `accounts` table on the
-source, start one capture stream, and run the production durable-chunk
-reconciler against a freshly truncated destination. The measured window is one
-complete backfill cycle, inside the timer:
+Marker apply is still the largest serial section. Finalization is next.
 
-1. Kafka end offset read
-2. source LOW-marker write and barrier wait (capture → Kafka → consumer)
-3. source upper-bound read
-4. durable job creation (`CreateJobAt`) and chunk discovery
-5. reconciler run, including process-shared scan/destination permit admission,
-   until the durable checkpoint passes the scan upper bound
+## Kafka
 
-Everything else is *outside* the timer: table reset, seeding, capture startup,
-per-iteration destination truncation, and the final exact-content
-verification.
+The local Kafka benchmark used one partition, replication factor one, and a
+224,077-byte transaction containing 1,000 rows.
 
-Timer correctness: Go's benchmark runner calls `StartTimer` before invoking the
-benchmark function (`testing.(*B).runN`), so the benchmark stops the timer
-before any setup. On every sample below, `ns/op` equals `10,000 / rows/s`
-within rounding, i.e. the two reported metrics derive from the same work-only
-window and neither includes setup.
+| Work | Median or range |
+| --- | ---: |
+| Full produce, fetch, reassembly, and decode | 14.69 ms median |
+| Produce acknowledgement | 2.77-3.94 ms |
+| Fetch and reassembly | 6.52-7.73 ms |
+| Decode | 4.36-5.90 ms |
+| Go allocation | 2.27-2.41 MB, about 10,190 allocations |
 
-Each worker count runs in a fresh `go test` process, so process-local state is
-reset. PostgreSQL, Kafka, filesystem, and OS caches remain shared across runs.
-The order alternates every pass (1-then-4 / 4-then-1) to reduce ordering bias.
-Every raw sample is printed and retained; none are culled.
+Kafka is not the current limit in this local workload. Seam keeps one partition
+because transactions, fragments, markers, and the destination frontier require
+one order. Adding partitions needs a new ordering protocol.
 
-After each run the full source and destination tables are merge-compared
-row-for-row in primary-key order outside the timer (`verifyExactContents`):
-missing rows, extra rows, duplicates, reordered rows, and changed column values
-all fail the benchmark. Every time reported below is therefore for a run whose
-destination contents matched the source exactly.
+## Changes tried
 
-### Environment
+| Change | Result | Decision |
+| --- | --- | --- |
+| Use 5,000-row chunks | 62.316 s to 20.055 s | Keep |
+| Cap workers to sealed chunks | 19.203 s to 16.632 s; lease calls 40 to 2 | Keep |
+| Single-marker stored procedure | 16.632 s to 14.901 s median | Keep |
+| Remove pre-scan cleanup | 20.830 s and 21.594 s | Revert |
+| Stop idle workers dynamically | 19.548 s and 20.943 s | Revert |
+| Poll markers every second | 21.896 s | Revert |
+| Join ledger and frontier reads | 20.503 s median | Revert |
+| Wait 1.5 s to batch markers | 23.881 s | Revert |
+| Join finalization reads | 20.144 s median versus 20.117 s control | Revert |
+| Skip marker route lookup | 20.745 s | Revert |
+| Driver multi-statement marker request | Stalled beyond 188 s | Revert |
 
-- Host: Omarchy, Linux kernel `7.2.5-3-omarchy`
-- CPU: Intel Core Ultra 5 225H, 14 logical CPUs (`GOMAXPROCS=14`)
-- Memory: 15.8 GiB
-- Go: `go1.27.1 linux/amd64`
-- Stack: `postgres:16` (source and destination, ports 5435/5436),
-  `confluentinc/cp-kafka:7.6.0` (port 9094), `confluentinc/cp-zookeeper:7.6.0`
-- All containers run on the same host as the benchmark; capture, workers, and
-  both PostgreSQL servers share the machine.
+## Correctness checks
 
-### Command
+The retained code passed unit tests, race tests, `go vet`, exact 10,000-row
+comparisons, and the live crash/replay test. The recovery test stopped the sink
+and a worker, took over their leases, replayed, validated, promoted twice, and
+finished with an exact 520-row match in 225.23 seconds.
 
-Everything below was produced by a single invocation (4 passes, 8 fresh
-processes), serialized so no two benchmark runs ever overlapped on the stack:
+## Run again
+
+PostgreSQL matrix:
 
 ```bash
-./scripts/bench-counterbalanced.sh 4
+./scripts/bench-matrix.sh
 ```
 
-Each fresh process runs one configuration as:
-
-```bash
-go test -tags=integration -count=1 -benchtime=1x -run '^$' -bench '^BenchmarkBackfillWorkers1$' ./integration/
-```
-
-(and likewise for `BenchmarkBackfillWorkers4`).
-
-### Raw results
-
-Every sample as printed by `go test` (verbatim; 1 iteration each, exact-content
-verification passed on all 8):
-
-| Pass | Order            | Worker | ns/op         | rows/s |
-|------|------------------|--------|---------------|--------|
-| 1    | 1 then 4         | 1      | 1818938953 ns/op | 5498 rows/s |
-| 1    | 1 then 4         | 4      | 1003707937 ns/op | 9963 rows/s |
-| 2    | 4 then 1         | 4      | 1040873139 ns/op | 9608 rows/s |
-| 2    | 4 then 1         | 1      | 1799198211 ns/op | 5558 rows/s |
-| 3    | 1 then 4         | 1      | 1723407698 ns/op | 5803 rows/s |
-| 3    | 1 then 4         | 4      | 1001090583 ns/op | 9990 rows/s |
-| 4    | 4 then 1         | 4      | 1012109699 ns/op | 9882 rows/s |
-| 4    | 4 then 1         | 1      | 1883056850 ns/op | 5311 rows/s |
-
-Median and range over the four samples per worker count:
-
-- 1 worker: median 1809068582 ns/op (~1.81 s), range 1723407698..1883056850
-  ns/op (1.72–1.88 s); median ~5.53k rows/s
-- 4 workers: median 1007908818 ns/op (~1.01 s), range 1001090583..1040873139
-  ns/op (1.00–1.04 s); median ~9.92k rows/s
-
-Self-consistency: `ns/op/1e9` × `rows/s` ≈ 10,000 on every sample (e.g. pass 1
-one worker: 1.8189 s × 5498 = 9999), confirming setup is outside both metrics.
-
-### Speedup
-
-Four workers complete the 10,000-row backfill faster than one worker in all
-four paired passes; the ratio is computed per pass from the same host state
-(4-worker ns/op ÷ 1-worker ns/op):
-
-| Pass | 4-worker ns/op | 1-worker ns/op | Time ratio |
-|------|----------------|----------------|------------|
-| 1    | 1.0037 s       | 1.8189 s       | 0.552×     |
-| 2    | 1.0409 s       | 1.7992 s       | 0.579×     |
-| 3    | 1.0011 s       | 1.7234 s       | 0.581×     |
-| 4    | 1.0121 s       | 1.8831 s       | 0.537×     |
-
-Median time ratio 0.566×, range 0.537×–0.581× → **≈1.77× wall-clock speedup
-with four workers (range ≈1.72×–1.86×)**. Throughput agrees: median ~5.53k vs
-~9.92k rows/s (≈1.79×).
-
-This supersedes the five ad-hoc runs of the previous single-process
-`BenchmarkBackfill` reported earlier in this workspace; the corrected
-counterbalanced run (fresh processes, alternating order, exact-content
-verification, one sample per worker per pass) is the current evidence.
-
-### Limitations
-
-- **Fixed workload only.** A single 10,000-row workload per sample with
-  `-benchtime=1x`, not a distribution of timings or varied row counts. It is a
-  starting point, not evidence of larger-scale speedups.
-- **No extrapolation to 10M/100M rows.** At 10,000 rows the constant overheads
-  (capture start, barrier latency, job creation, worker coordination) are a
-  large fraction of total time; the same multiplier must not be assumed for
-  large scans.
-- **Shared host.** Source, destination, Kafka, and the workers contend for the
-  same CPUs; absolute numbers are lower and wall-clock speedup dampened
-  compared with dedicated infrastructure. It cannot be treated as
-  network-separated performance.
-- **One capture stream for both worker counts.** The 4-worker case consumes
-  the same single-partition Kafka topic; capture is not sharded, so 4 workers
-  cannot be expected to scale capture-bound phases.
-
-## Snowflake snapshot-staging baseline — September 30, 2026
-
-This benchmark measures only `Store.StageSnapshot`: delete the disposable
-stage for one leased chunk, encode rows, submit parameterized multi-row
-`INSERT ... SELECT ... UNION ALL` batches of at most 500 rows, persist the row
-count, and commit. PostgreSQL scanning, Kafka, LOW/HIGH catch-up, final
-Snowflake `MERGE`, validation, and promotion are outside the timer. It is a
-component measurement, not an end-to-end throughput claim.
-
-Executed command:
-
-```bash
-go test -tags=snowflake_integration -run '^$' \
-  -bench '^BenchmarkLiveSnowflakeStageSnapshot$' \
-  -benchtime=1x -count=1 ./internal/snowflake
-```
-
-One fresh temporary Snowflake schema was used per case and removed afterwards.
-Rows contained a `BIGINT` key and a 96-byte text value.
-
-| Rows | Wall time | Rows/s | Approximate payload MB/s |
-| ---: | ---: | ---: | ---: |
-| 100 | 2.7337 s | 36.58 | below 0.01 |
-| 1,000 | 6.2366 s | 160.3 | 0.02 |
-| 5,000 | 26.5800 s | 188.1 | 0.02 |
-
-The rise from 36.6 to 188.1 rows/s shows fixed request/transaction overhead is
-amortized by larger batches. At the time, the plateau near 188 rows/s identified
-parameterized row staging as the immediate warehouse-side bottleneck for this
-workload. That baseline motivated the bulk loader described below.
-
-This was one execution per size against the configured account. Warehouse
-size, cache state, network path, and credit consumption were not captured, so
-the absolute values must not be compared with vendor results or extrapolated.
-
-## Snowflake bulk loader and bottleneck results
-
-The snapshot path has two selectable implementations. `sql` is the former
-parameterized `INSERT ... UNION ALL` control. `bulk` writes deterministic gzip
-JSON lines, records a durable file manifest, uploads with `PUT`, and reloads
-the chunk's disposable candidate rows with `COPY INTO`. The copy transaction
-verifies Snowflake's `rows_loaded` result and advances chunk progress under the
-current lease token.
-
-Run both paths against identical inputs with:
+Snowflake loader comparison:
 
 ```bash
 make benchmark-snowflake-load
 ```
 
-The following environment variables define the experiment:
+Snowflake end-to-end profile:
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `SEAM_SNOWFLAKE_BENCH_ROWS` | `100,1000,5000` | comma separated row counts |
-| `SEAM_SNOWFLAKE_BENCH_PAYLOAD_BYTES` | `96` | text bytes per row, excluding the key |
-| `SEAM_SNOWFLAKE_UPLOAD_PARALLEL` | `4` | file upload parallelism |
-| `LOADERS` | `sql bulk` | implementations to run in order |
-| `RESULT_DIR` | `benchmark-results/snowflake` | ignored directory for raw output |
+```bash
+SEAM_RUN_SNOWFLAKE_BACKFILL_PROFILE=1 \
+SEAM_SNOWFLAKE_PROFILE_ROWS=10000 \
+SEAM_SNOWFLAKE_PROFILE_CHUNK_SIZE=10000 \
+SEAM_SNOWFLAKE_PROFILE_WORKERS=4 \
+SEAM_SNOWFLAKE_PROFILE_POLL_MS=250 \
+go test -tags='integration snowflake_integration' -count=1 \
+  -run '^TestSnowflakeBackfillProfile$' -v ./integration
+```
 
-Each case creates isolated schemas and removes them afterward. The timed region
-contains only snapshot staging. PostgreSQL scanning, Kafka, LOW/HIGH catch-up,
-candidate finalization, validation, and promotion remain outside the timer.
-The script records the exact commit, dirty state, Go version, host, kernel, and
-workload beside raw `go test -json` output.
+Kafka transport:
 
-### October 5, 2026 measured results
+```bash
+go test -tags=integration -run '^$' \
+  -bench '^BenchmarkKafkaTransport/rows_1000$' \
+  -benchtime=20x -count=3 ./integration
+```
 
-The optimization work used 1,000 rows with a 96 byte text payload on an
-X-Small warehouse. Each accepted change was benchmarked separately. The final
-three iteration single-worker result and one four-worker result were:
-
-| Workers | Rows per run | Wall time | Throughput | Go bytes per run | Go allocations per run |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1,000 | 3.278 s | 305.1 rows/s | 4,049,136 | 44,975 |
-| 4 | 4,000 | 5.036 s | 794.3 rows/s | 16,634,080 | 187,848 |
-
-The comparable earlier measurements were 5.355 seconds for one worker and
-8.885 seconds for four workers. Single-worker latency improved by 38.8
-percent. Four-worker throughput improved from 450 to 794 rows/s, and scaling
-relative to one worker improved from 2.08x to 2.60x.
-
-The retained changes were made one at a time:
-
-1. Combined snapshot lease validation and manifest preparation into one
-   lease-conditional `MERGE`.
-2. Removed the second manifest state update after the deterministic,
-   content-addressed `PUT`.
-3. Used the `COPY INTO` result's `rows_loaded` field for exact row-count
-   verification instead of issuing a separate `COUNT(*)` query.
-4. Removed an unused loaded-file state update. The durable file manifest
-   remains, and `COPY INTO` plus the fenced chunk progress update still commit
-   or roll back in one transaction.
-
-The current COPY transaction averaged 1.983 seconds. The COPY statement itself
-averaged 0.537 seconds. The remaining time was serial Snowflake work: begin,
-lease validation, staging delete, fenced progress update, and commit. Query
-history reported no warehouse overload or transaction-blocked wait in the
-single-worker sample. At four workers, manifest preparation and COPY
-transactions showed overlapping service time and did not scale linearly.
-
-Every retained change passed unit and race tests. The final live recovery run
-also passed sink takeover, worker restart, replay, exact comparison of 520
-rows, and idempotent promotion in 150.70 seconds. That run is correctness and
-failure-recovery evidence, not a throughput benchmark.
-
-### Kafka result and partition limit
-
-The local Kafka transport benchmark used one partition, replication factor
-one, all-ISR acknowledgements, and a 224,077 byte transaction containing 1,000
-rows. Three 20-iteration samples measured 14.90, 15.24, and 15.10 milliseconds
-per produce, fetch, reassembly, and decode cycle. Produce acknowledgement was
-about 2.8 to 2.9 milliseconds, fetch and reassembly about 6.8 to 6.9
-milliseconds, and decode about 5.2 to 5.4 milliseconds.
-
-Kafka was therefore under 0.5 percent of the measured Snowflake staging time
-for this workload and was not optimized. This does not establish Kafka's
-maximum throughput. Seam currently requires exactly one ordered partition per
-pipeline because LOW/HIGH markers, transaction fragments, and the durable
-frontier share one total order. Multi-partition CDC would require per-partition
-frontiers and explicit cross-partition transaction and marker coordination;
-simply increasing the topic partition count is not safe and is rejected at
-startup.
-
-### Limits of these results
-
-- The Snowflake rows are small and highly compressible.
-- The one-worker result is a three-iteration average; the four-worker result is
-  one run, not a latency distribution.
-- Warehouse cache state, service variance, account limits, and credits affect
-  absolute timings.
-- The Kafka broker was local and single replica. The result does not describe
-  a remote replicated production cluster or broker saturation.
-- These component measurements do not include the source scan or final target
-  merge. They identify the limiting work in the tested path only.
+These are small shared-host tests, not production capacity claims. Snowflake
+service variance, warehouse size, row width, cache state, and credit limits can
+change the absolute numbers.

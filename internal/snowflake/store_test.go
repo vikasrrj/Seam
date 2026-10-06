@@ -143,6 +143,27 @@ func TestStageInsertSQLBatchesRowsInOneStatement(t *testing.T) {
 	}
 }
 
+func TestMarkerProcedureUsesCallerTransactionAndChecksEveryWrite(t *testing.T) {
+	query := createMarkerProcedureSQL(testConfig())
+	for _, required := range []string{
+		"CREATE OR REPLACE PROCEDURE", "EXECUTE AS CALLER", "getNumRowsAffected",
+		"marker insert", "lease fence", "replay ledger insert", "frontier compare-and-set",
+		`INSERT INTO \"DB\".\"SEAM_INTERNAL\".\"MARKERS\"`,
+		`UPDATE \"DB\".\"SEAM_INTERNAL\".\"SINK_LEASES\"`,
+		`INSERT INTO \"DB\".\"SEAM_INTERNAL\".\"APPLIED_TRANSACTIONS\"`,
+		`UPDATE \"DB\".\"SEAM_INTERNAL\".\"OFFSETS\"`,
+	} {
+		if !strings.Contains(query, required) {
+			t.Fatalf("marker procedure lacks %q", required)
+		}
+	}
+	for _, forbidden := range []string{"BEGIN TRANSACTION", "COMMIT", "ROLLBACK"} {
+		if strings.Contains(query, forbidden) {
+			t.Fatalf("marker procedure must remain inside caller transaction, found %q", forbidden)
+		}
+	}
+}
+
 func TestMergeSQLUsesStreamScopedSequenceClock(t *testing.T) {
 	cfg := testConfig()
 	source := testSchema()

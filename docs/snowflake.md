@@ -143,6 +143,16 @@ Backfill uses `SEAM_BACKFILL_JOB_ID`, `SEAM_BACKFILL_ATTEMPT`,
 directory, and `SEAM_SNOWFLAKE_UPLOAD_PARALLEL` controls Snowflake file upload
 parallelism from 1 through 99.
 
+For the documented 10,000-row narrow-row workload, 5,000-row chunks reduced
+exact-verified backfill time from 62.316 seconds with 1,000-row chunks to
+20.055 seconds. The existing 10,000-row default was then measured at 19.203
+seconds before worker capping and 16.632 seconds after the coordinator stopped
+starting more local workers than the manifest has chunks. The retained
+single-marker procedure then reduced the median of two exact runs to 14.901
+seconds, about 671 rows/s. Keep 10,000 as the
+measured starting point for this workload, not as a universal rule: wider rows
+increase memory, file size, retry cost, and recovery granularity.
+
 Promotion uses `SNOWFLAKE_VALIDATION_TABLE`, `SEAM_MAX_WRITE_PAUSE`,
 `SEAM_SOURCE_LOCK_TIMEOUT`, and `SEAM_MAX_DELTA_KEYS`.
 
@@ -241,6 +251,21 @@ and workload metadata under the ignored `benchmark-results` directory.
 make benchmark-snowflake-load
 ```
 
+The opt-in end-to-end profile creates isolated Snowflake schemas, resets the
+dedicated integration stack, runs capture, sink, source scan, PUT, COPY,
+marker reconciliation, and finalization, then compares every source and shadow
+row exactly:
+
+```bash
+SEAM_RUN_SNOWFLAKE_BACKFILL_PROFILE=1 \
+SEAM_SNOWFLAKE_PROFILE_ROWS=10000 \
+SEAM_SNOWFLAKE_PROFILE_CHUNK_SIZE=10000 \
+SEAM_SNOWFLAKE_PROFILE_WORKERS=4 \
+SEAM_SNOWFLAKE_PROFILE_POLL_MS=250 \
+go test -tags='integration snowflake_integration' -count=1 \
+  -run '^TestSnowflakeBackfillProfile$' -v ./integration
+```
+
 With the dedicated PostgreSQL/Kafka integration stack running, the combined
 test deliberately stops the sink and coordinator, takes over under new epochs
 and leases, validates, promotes twice, and compares every source and Snowflake
@@ -251,11 +276,13 @@ go test -tags='integration snowflake_integration' -count=1 -timeout 10m \
   -run '^TestSnowflakeOnlineBackfillCrashRecovery$' -v ./integration
 ```
 
-This test passed on September 30, 2026 in 210.14 seconds. It finished with an
-exact 520-row source/destination match after the intentional sink crash,
-30-second lease takeover, coordinator stop, four-worker recovery, validation,
+The latest accepted run passed on October 6, 2026 in 225.23 seconds. It
+finished with an exact 520-row source/destination match after the intentional
+sink crash, lease takeover, coordinator stop, four-worker recovery, validation,
 promotion, and idempotent promotion retry. This is a small correctness and
-recovery scenario, not a throughput benchmark.
+recovery scenario, not a throughput benchmark. The test uses the production
+default two-minute chunk lease; a 30-second test lease correctly fenced a
+healthy worker when live Snowflake latency exceeded the artificial lease.
 
 ## Current performance limits
 
@@ -270,9 +297,11 @@ path, multi-partition ordering protocol, adaptive warehouse controller, or
 large Snowflake benchmark yet.
 
 The September 30, 2026 SQL-loader baseline reached 36.6, 160.3, and 188.1
-rows/s for 100, 1,000, and 5,000 rows. It is not an end-to-end result. The bulk
-path has not yet been run against a live account in the current revision, so no
-improvement is claimed. The next measurement must report bytes per second,
-rows per second, file encoding and upload time, copy and merge time, warehouse
-size and credits, source impact, Kafka lag, and recovery time under fixed row
-width distributions.
+rows/s for 100, 1,000, and 5,000 rows. The current live bulk-loader benchmark
+reached 305.1 rows/s for one worker loading 1,000 rows and 794.3 rows/s for four
+workers loading 4,000 rows. The exact-verified end-to-end 10,000-row backfill
+reached 160.5 rows/s with 1,000-row chunks, 498.6 rows/s with 5,000-row chunks,
+601.2 rows/s with one 10,000-row chunk after worker capping, and about 671
+rows/s after collapsing single-marker writes into one procedure call inside the
+same transaction. Validation, promotion, warehouse credits, large-row
+distributions, and production-scale runs still need separate measurement.

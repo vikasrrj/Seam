@@ -145,7 +145,7 @@ func TestSnowflakeOnlineBackfillCrashRecovery(t *testing.T) {
 	}
 
 	const sinkLease = 30 * time.Second
-	const chunkLease = 30 * time.Second
+	const chunkLease = 2 * time.Minute
 	sink1, err := startTestSnowflakeSink(ctx, store, topicID, "sink-before-crash", sinkLease)
 	if err != nil {
 		t.Fatal(err)
@@ -167,10 +167,9 @@ func TestSnowflakeOnlineBackfillCrashRecovery(t *testing.T) {
 	coordinatorCfg := snowreconcile.Config{
 		JobID: jobID, Attempt: attempt, ShadowTable: "ACCOUNTS_SHADOW",
 		ChunkSize: 50, Workers: 1, WorkerID: "worker-before-crash",
-		// Snowflake control-plane calls can take several seconds. Keep the
-		// backfill lease long enough that a healthy heartbeat is not fenced by
-		// ordinary warehouse latency. Thirty seconds still keeps intentional
-		// takeover and recovery bounded inside the test timeout.
+		// Match the production default: live Snowflake control-plane latency can
+		// exceed 30 seconds, and a failure test must not confuse a slow healthy
+		// statement with a lost worker. Heartbeats still fence an actual takeover.
 		Lease: chunkLease, Heartbeat: 5 * time.Second, Poll: 100 * time.Millisecond,
 	}
 	coordinator, err := snowreconcile.New(coordinatorCfg, store, scanner, markers)
@@ -276,6 +275,8 @@ type runningSnowflakeSink struct {
 	lease  *seamsnowflake.SinkLease
 }
 
+const testSnowflakeReleaseTimeout = 30 * time.Second
+
 func startTestSnowflakeSink(parent context.Context, store *seamsnowflake.Store, topicID, owner string, duration time.Duration) (*runningSnowflakeSink, error) {
 	lease, err := store.AcquireSinkLease(parent, owner, duration)
 	if err != nil {
@@ -287,7 +288,7 @@ func startTestSnowflakeSink(parent context.Context, store *seamsnowflake.Store, 
 	}
 	consumer, err := kafka.NewConsumer(itest.KafkaBrokers(), itest.KafkaTopic(), next, snowflakeDecode, kafka.WithExpectedTopicID(topicID), kafka.WithMaxPollRecords(100))
 	if err != nil {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		releaseCtx, cancel := context.WithTimeout(context.Background(), testSnowflakeReleaseTimeout)
 		defer cancel()
 		_ = store.ReleaseSinkLease(releaseCtx, lease)
 		return nil, err
@@ -352,7 +353,7 @@ func (sink *runningSnowflakeSink) stopAndRelease(store *seamsnowflake.Store) err
 	if errors.Is(runErr, context.Canceled) {
 		runErr = nil
 	}
-	releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	releaseCtx, cancel := context.WithTimeout(context.Background(), testSnowflakeReleaseTimeout)
 	defer cancel()
 	releaseErr := store.ReleaseSinkLease(releaseCtx, sink.lease)
 	return errors.Join(runErr, releaseErr)
