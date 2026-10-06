@@ -176,8 +176,8 @@ the full source and destination are merge-compared row-for-row in key order
 (not just counted), so the reported times are for runs whose contents matched
 exactly. Executed samples are in `docs/benchmarks.md`. The fixed 10,000-row
 workload does not measure a large online resync, source-write contention, CDC
-lag under load, WAL retention, or peak memory at 10M/100M-row scale; do not
-infer an Artie-like multiplier from it.
+lag under load, WAL retention, or peak memory at 10M/100M-row scale. Do not
+extrapolate the measured multiplier beyond the tested workload.
 
 ## Deliberate limits
 

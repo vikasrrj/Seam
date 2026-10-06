@@ -176,8 +176,7 @@ measured.
 
 ## Documentation
 
-- [System ownership report](docs/SEAM-system-ownership-report.md) — the full
-  explanation from first principles
 - [PostgreSQL operations](docs/operations.md) and
-  [Snowflake operations](docs/snowflake.md) — running each destination path
-- [Benchmarks](docs/benchmarks.md) — raw results and measurement boundaries
+  [Snowflake operations](docs/snowflake.md) - running each destination path
+- [Generic row design](docs/generic-row-design.md) - schema and type contract
+- [Benchmarks](docs/benchmarks.md) - results and measurement boundaries
