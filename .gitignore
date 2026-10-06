@@ -9,3 +9,8 @@
 
 # local benchmark output
 /benchmark-results/
+
+# local credentials and machine-specific configuration
+/.env
+/.env.*
+!/.env.example

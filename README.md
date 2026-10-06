@@ -30,6 +30,10 @@ to keep acknowledging WAL no matter what a backfill is doing, and a backfill
 crash must never stall the stream. `seam-lab` verifies a destination against the
 source.
 
+For local configuration, copy `.env.example` to an ignored `.env` file and add
+the Snowflake credentials when using that destination. Load it in each terminal
+with `set -a; source .env; set +a` before starting a process.
+
 ## Why this project exists
 
 A table copy is unsafe the moment the source keeps taking writes: a snapshot can
