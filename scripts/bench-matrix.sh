@@ -45,10 +45,17 @@ for rows in $ROWS_LIST; do
           exit 1
         fi
         parsed="$(printf '%s\n' "$line" | awk '
-          $4 == "ns/op" && $6 == "MiB/s" && $8 == "discover-ms/op" &&
-          $10 == "reconcile-ms/op" && $12 == "rows/s" {
-            printf "%s\t%s\t%s\t%s\t%s\t%s", $3, $5, $7, $9, $11, $1
-            found = 1
+          {
+            for (i = 3; i < NF; i += 2) {
+              value[$(i + 1)] = $i
+            }
+            if (value["ns/op"] != "" && value["MiB/s"] != "" &&
+                value["discover-ms/op"] != "" && value["reconcile-ms/op"] != "" &&
+                value["rows/s"] != "") {
+              printf "%s\t%s\t%s\t%s\t%s\t%s", value["ns/op"], value["MiB/s"],
+                value["discover-ms/op"], value["reconcile-ms/op"], value["rows/s"], $1
+              found = 1
+            }
           }
           END { if (!found) exit 1 }
         ')" || {

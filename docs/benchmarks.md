@@ -214,14 +214,14 @@ This was one execution per size against the configured account. Warehouse
 size, cache state, network path, and credit consumption were not captured, so
 the absolute values must not be compared with vendor results or extrapolated.
 
-## Snowflake bulk-loader comparison
+## Snowflake bulk loader and bottleneck results
 
-The snapshot path now has two selectable implementations. `sql` is the former
+The snapshot path has two selectable implementations. `sql` is the former
 parameterized `INSERT ... UNION ALL` control. `bulk` writes deterministic gzip
 JSON lines, records a durable file manifest, uploads with `PUT`, and reloads
 the chunk's disposable candidate rows with `COPY INTO`. The copy transaction
-also verifies the exact staged row count and advances the file and chunk state
-under the current lease token.
+verifies Snowflake's `rows_loaded` result and advances chunk progress under the
+current lease token.
 
 Run both paths against identical inputs with:
 
@@ -243,6 +243,74 @@ Each case creates isolated schemas and removes them afterward. The timed region
 contains only snapshot staging. PostgreSQL scanning, Kafka, LOW/HIGH catch-up,
 candidate finalization, validation, and promotion remain outside the timer.
 The script records the exact commit, dirty state, Go version, host, kernel, and
-workload beside raw `go test -json` output. There is no post-change live result
-in this document yet; the loader is implemented and tested, but its throughput
-must not be inferred from the design.
+workload beside raw `go test -json` output.
+
+### October 5, 2026 measured results
+
+The optimization work used 1,000 rows with a 96 byte text payload on an
+X-Small warehouse. Each accepted change was benchmarked separately. The final
+three iteration single-worker result and one four-worker result were:
+
+| Workers | Rows per run | Wall time | Throughput | Go bytes per run | Go allocations per run |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,000 | 3.278 s | 305.1 rows/s | 4,049,136 | 44,975 |
+| 4 | 4,000 | 5.036 s | 794.3 rows/s | 16,634,080 | 187,848 |
+
+The comparable earlier measurements were 5.355 seconds for one worker and
+8.885 seconds for four workers. Single-worker latency improved by 38.8
+percent. Four-worker throughput improved from 450 to 794 rows/s, and scaling
+relative to one worker improved from 2.08x to 2.60x.
+
+The retained changes were made one at a time:
+
+1. Combined snapshot lease validation and manifest preparation into one
+   lease-conditional `MERGE`.
+2. Removed the second manifest state update after the deterministic,
+   content-addressed `PUT`.
+3. Used the `COPY INTO` result's `rows_loaded` field for exact row-count
+   verification instead of issuing a separate `COUNT(*)` query.
+4. Removed an unused loaded-file state update. The durable file manifest
+   remains, and `COPY INTO` plus the fenced chunk progress update still commit
+   or roll back in one transaction.
+
+The current COPY transaction averaged 1.983 seconds. The COPY statement itself
+averaged 0.537 seconds. The remaining time was serial Snowflake work: begin,
+lease validation, staging delete, fenced progress update, and commit. Query
+history reported no warehouse overload or transaction-blocked wait in the
+single-worker sample. At four workers, manifest preparation and COPY
+transactions showed overlapping service time and did not scale linearly.
+
+Every retained change passed unit and race tests. The final live recovery run
+also passed sink takeover, worker restart, replay, exact comparison of 520
+rows, and idempotent promotion in 150.70 seconds. That run is correctness and
+failure-recovery evidence, not a throughput benchmark.
+
+### Kafka result and partition limit
+
+The local Kafka transport benchmark used one partition, replication factor
+one, all-ISR acknowledgements, and a 224,077 byte transaction containing 1,000
+rows. Three 20-iteration samples measured 14.90, 15.24, and 15.10 milliseconds
+per produce, fetch, reassembly, and decode cycle. Produce acknowledgement was
+about 2.8 to 2.9 milliseconds, fetch and reassembly about 6.8 to 6.9
+milliseconds, and decode about 5.2 to 5.4 milliseconds.
+
+Kafka was therefore under 0.5 percent of the measured Snowflake staging time
+for this workload and was not optimized. This does not establish Kafka's
+maximum throughput. Seam currently requires exactly one ordered partition per
+pipeline because LOW/HIGH markers, transaction fragments, and the durable
+frontier share one total order. Multi-partition CDC would require per-partition
+frontiers and explicit cross-partition transaction and marker coordination;
+simply increasing the topic partition count is not safe and is rejected at
+startup.
+
+### Limits of these results
+
+- The Snowflake rows are small and highly compressible.
+- The one-worker result is a three-iteration average; the four-worker result is
+  one run, not a latency distribution.
+- Warehouse cache state, service variance, account limits, and credits affect
+  absolute timings.
+- The Kafka broker was local and single replica. The result does not describe
+  a remote replicated production cluster or broker saturation.
+- These component measurements do not include the source scan or final target
+  merge. They identify the limiting work in the tested path only.

@@ -497,6 +497,7 @@ func (s *Store) SealChunkScan(ctx context.Context, lease *ChunkLease, highMarker
 // then atomically merges candidates, completes the chunk, and clears staging.
 // Any key with a CDC clock newer than LOW is excluded, including tombstones.
 func (s *Store) FinalizeChunk(ctx context.Context, lease *ChunkLease) error {
+	defer startPhase(ctx, "snapshot-finalize-transaction")()
 	if err := validateLease(lease, s.cfg.StreamID); err != nil {
 		return err
 	}
@@ -527,12 +528,21 @@ func (s *Store) FinalizeChunk(ctx context.Context, lease *ChunkLease) error {
 	if err != nil {
 		return err
 	}
+	finishMerge := startPhase(ctx, "snapshot-target-merge")
 	result, err := tx.ExecContext(ctx, mergeSQL, s.cfg.StreamID, routeID, s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, strconv.FormatUint(lowLSN, 10))
+	finishMerge()
 	if err != nil {
 		return fmt.Errorf("merge Snowflake snapshot chunk %s: %w", lease.Range, err)
 	}
 	rowsApplied, err := result.RowsAffected()
 	if err != nil {
+		return err
+	}
+	// COPY transactions acquire SNAPSHOT_STAGE before BACKFILL_CHUNKS. Keep
+	// finalization in the same table-lock order: after MERGE has consumed the
+	// candidates, clear their stage rows before completing the chunk. All of
+	// these effects remain atomic and roll back together on a fencing failure.
+	if _, err := tx.ExecContext(ctx, "DELETE FROM "+s.cfg.internal("SNAPSHOT_STAGE")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min); err != nil {
 		return err
 	}
 	result, err = tx.ExecContext(ctx, "UPDATE "+s.cfg.internal("BACKFILL_CHUNKS")+" SET STATE = ?, LOW_LSN = ?, ROWS_APPLIED = ?, LEASE_EXPIRES = NULL, UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ? AND LEASE_OWNER = ? AND LEASE_TOKEN = ? AND LEASE_EXPIRES > CURRENT_TIMESTAMP() AND STATE = ?", string(model.ChunkCompleted), strconv.FormatUint(lowLSN, 10), rowsApplied, s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.WorkerID, lease.LeaseToken, string(model.ChunkCommitting))
@@ -541,9 +551,6 @@ func (s *Store) FinalizeChunk(ctx context.Context, lease *ChunkLease) error {
 	}
 	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
 		return fmt.Errorf("finalize Snowflake chunk %s: lease was fenced during merge", lease.Range)
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM "+s.cfg.internal("SNAPSHOT_STAGE")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min); err != nil {
-		return err
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE "+s.cfg.internal("BACKFILL_JOBS")+" SET COMPLETED_CHUNKS = (SELECT COUNT(*) FROM "+s.cfg.internal("BACKFILL_CHUNKS")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND STATE = ?), STATE = IFF((SELECT COUNT(*) FROM "+s.cfg.internal("BACKFILL_CHUNKS")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND STATE <> ?) = 0, ?, STATE), UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND STATE = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, string(model.ChunkCompleted), s.cfg.StreamID, lease.JobID, lease.Attempt, string(model.ChunkCompleted), string(BackfillReadyToVerify), s.cfg.StreamID, lease.JobID, lease.Attempt, string(BackfillRunning)); err != nil {
 		return err

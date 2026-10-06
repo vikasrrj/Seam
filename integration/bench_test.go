@@ -150,8 +150,16 @@ func benchBackfill(b *testing.B, bench backfillBenchConfig) {
 	defer destPermits.Close()
 
 	var total time.Duration
-	var discoveryTotal time.Duration
-	var reconcileTotal time.Duration
+	phaseTotal := make(map[string]time.Duration)
+	var profile *benchProfile
+	var sourceDatabaseProfile, destinationDatabaseProfile postgresProfile
+	var sourceBaselineWALLSN, destinationBaselineWALLSN string
+	if os.Getenv("SEAM_BENCH_PROFILE") == "1" {
+		profile = newBenchProfile()
+	}
+	addPhase := func(name string, started time.Time) {
+		phaseTotal[name] += time.Since(started)
+	}
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		dst, err := itest.DestConn(ctx)
@@ -170,47 +178,72 @@ func benchBackfill(b *testing.B, bench backfillBenchConfig) {
 			Workers: bench.workers, WorkerID: jobID, LeaseDuration: 30 * time.Second,
 			MaxInMemoryCandidates: bench.chunkSize, MaxRecordsPerBatch: 100, HeartbeatInterval: 10 * time.Second,
 		}
+		if profile != nil {
+			if sourceBaselineWALLSN, err = resetPostgresProfile(ctx, itest.SourceDSN()); err != nil {
+				b.Fatal(err)
+			}
+			if destinationBaselineWALLSN, err = resetPostgresProfile(ctx, itest.DestDSN()); err != nil {
+				b.Fatal(err)
+			}
+		}
 		b.StartTimer()
 		started := time.Now()
+		phaseStarted := time.Now()
 		end, err := kafka.EndOffset(ctx, itest.KafkaBrokers(), itest.KafkaTopic())
+		addPhase("kafka-end", phaseStarted)
 		if err != nil {
 			b.Fatal(err)
 		}
+		phaseStarted = time.Now()
 		barrierID, err := markers.WriteBarrier(ctx, jobID, "gen:0:attempt:0")
+		addPhase("barrier-write", phaseStarted)
 		if err != nil {
 			b.Fatal(err)
 		}
+		phaseStarted = time.Now()
 		start, err := kafka.WaitForBarrier(ctx, itest.KafkaBrokers(), itest.KafkaTopic(), barrierID, end, benchDecode)
+		addPhase("barrier-wait", phaseStarted)
 		if err != nil {
 			b.Fatal(err)
 		}
+		phaseStarted = time.Now()
 		chunkReader, err := scan.NewChunkReader(ctx, itest.SourceDSN())
+		addPhase("source-open", phaseStarted)
 		if err != nil {
 			b.Fatal(err)
 		}
+		phaseStarted = time.Now()
 		upper, err := chunkReader.UpperBound(ctx)
+		addPhase("upper-bound", phaseStarted)
 		if err != nil {
 			b.Fatal(err)
 		}
+		phaseStarted = time.Now()
 		mutator, err := sink.NewMutatorFor("accounts", chunkReader.Schema())
+		addPhase("sink-create", phaseStarted)
 		if err != nil {
 			b.Fatal(err)
 		}
+		phaseStarted = time.Now()
 		cp, err := store.CreateJobAt(ctx, cfg, chunkReader.Schema(), upper, start)
+		addPhase("job-create", phaseStarted)
 		if err != nil {
 			b.Fatal(err)
 		}
-		discoveryStarted := time.Now()
+		phaseStarted = time.Now()
 		if err := store.DiscoverAndCreateChunks(ctx, jobID, cp.Attempt, itest.SourceDSN(), chunkReader.Schema(), upper, cfg.ChunkSize); err != nil {
 			b.Fatal(err)
 		}
-		discoveryTotal += time.Since(discoveryStarted)
+		addPhase("discover", phaseStarted)
+		phaseStarted = time.Now()
 		consumer, err := kafka.NewConsumer(itest.KafkaBrokers(), itest.KafkaTopic(), start, benchDecode, kafka.WithExpectedTopicID(topicID))
+		addPhase("consumer-create", phaseStarted)
 		if err != nil {
 			b.Fatal(err)
 		}
 		recCtx, stopRec := context.WithCancel(ctx)
 		recDone := make(chan error, 1)
+		phaseStarted = time.Now()
 		resources, err := resourcecontrol.New(resourcecontrol.Config{
 			MaxSourceScans: bench.workers, MaxDestTx: 8, MaxCDCLag: 10_000,
 			PollInterval: time.Second, ScanPermits: scanPermits, DestPermits: destPermits,
@@ -221,10 +254,23 @@ func benchBackfill(b *testing.B, bench backfillBenchConfig) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		rec := reconcile.New(reconcile.Config{JobConfig: cfg, Checkpoint: cp, Consumer: consumer,
-			CheckpointStore: store, ChunkStore: store, MarkerStore: markers,
-			Scanner: chunkReader, Sink: mutator, SourceSchema: chunkReader.Schema(), Resources: resources})
-		reconcileStarted := time.Now()
+		addPhase("resource-create", phaseStarted)
+		var rec *reconcile.Reconciler
+		if profile == nil {
+			rec = reconcile.New(reconcile.Config{JobConfig: cfg, Checkpoint: cp, Consumer: consumer,
+				CheckpointStore: store, ChunkStore: store, MarkerStore: markers,
+				Scanner: chunkReader, Sink: mutator, SourceSchema: chunkReader.Schema(), Resources: resources})
+		} else {
+			profiledStore := &profiledStore{base: store, profile: profile}
+			rec = reconcile.New(reconcile.Config{JobConfig: cfg, Checkpoint: cp,
+				Consumer:        &profiledConsumer{base: consumer, profile: profile},
+				CheckpointStore: profiledStore, ChunkStore: profiledStore,
+				MarkerStore: &profiledMarkerStore{base: markers, profile: profile},
+				Scanner:     &profiledScanner{base: chunkReader, profile: profile},
+				Sink:        &profiledSink{base: mutator, profile: profile}, SourceSchema: chunkReader.Schema(),
+				Resources: &profiledResources{base: resources, profile: profile}})
+		}
+		phaseStarted = time.Now()
 		go func() { recDone <- rec.Run(recCtx) }()
 		for {
 			current, err := store.LoadCheckpoint(ctx, jobID)
@@ -242,7 +288,7 @@ func benchBackfill(b *testing.B, bench backfillBenchConfig) {
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
-		reconcileTotal += time.Since(reconcileStarted)
+		addPhase("reconcile", phaseStarted)
 		total += time.Since(started)
 		b.StopTimer()
 		stopRec()
@@ -256,6 +302,16 @@ func benchBackfill(b *testing.B, bench backfillBenchConfig) {
 			b.Fatal("reconciler did not stop")
 		}
 		dst.Close(context.Background())
+		if profile != nil {
+			sourceDatabaseProfile, err = readPostgresProfile(ctx, itest.SourceDSN(), sourceBaselineWALLSN)
+			if err != nil {
+				b.Fatal(err)
+			}
+			destinationDatabaseProfile, err = readPostgresProfile(ctx, itest.DestDSN(), destinationBaselineWALLSN)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
 
 		// Exact-content verification OUTSIDE the timer: an ordered merge of the
 		// full source and destination tables (count and every row value), not
@@ -264,8 +320,21 @@ func benchBackfill(b *testing.B, bench backfillBenchConfig) {
 	}
 	b.ReportMetric(float64(bench.rows*b.N)/total.Seconds(), "rows/s")
 	b.ReportMetric((float64((bench.ownerBytes+16)*bench.rows*b.N)/(1<<20))/total.Seconds(), "MiB/s")
-	b.ReportMetric(float64(discoveryTotal.Milliseconds())/float64(b.N), "discover-ms/op")
-	b.ReportMetric(float64(reconcileTotal.Milliseconds())/float64(b.N), "reconcile-ms/op")
+	var classified time.Duration
+	for name, duration := range phaseTotal {
+		classified += duration
+		b.ReportMetric(float64(duration.Microseconds())/1000/float64(b.N), name+"-ms/op")
+	}
+	unclassified := total - classified
+	if unclassified < 0 {
+		unclassified = 0
+	}
+	b.ReportMetric(float64(unclassified.Microseconds())/1000/float64(b.N), "unclassified-ms/op")
+	if profile != nil {
+		profile.report(b.N, phaseTotal["reconcile"])
+		printPostgresProfile("source", sourceDatabaseProfile)
+		printPostgresProfile("destination", destinationDatabaseProfile)
+	}
 }
 
 // verifyExactContents compares source and destination row-for-row in key order

@@ -144,6 +144,7 @@ func TestFinalizeChunkRollsBackTargetMergeWhenLeaseWasFenced(t *testing.T) {
 	mock.ExpectQuery("SELECT 1 FROM .*MARKERS").
 		WillReturnRows(sqlmock.NewRows([]string{"one"}).AddRow(1))
 	mock.ExpectExec("MERGE INTO .*ACCOUNTS_SHADOW").WillReturnResult(sqlmock.NewResult(0, 5))
+	mock.ExpectExec("DELETE FROM .*SNAPSHOT_STAGE").WillReturnResult(sqlmock.NewResult(0, 5))
 	mock.ExpectExec("UPDATE .*BACKFILL_CHUNKS").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectRollback()
 

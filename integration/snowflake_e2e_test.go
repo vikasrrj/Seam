@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +44,24 @@ func TestSnowflakeOnlineBackfillCrashRecovery(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
+	if os.Getenv("SEAM_BENCH_PROFILE") == "1" {
+		var mu sync.Mutex
+		totals := make(map[string]time.Duration)
+		counts := make(map[string]int)
+		ctx = seamsnowflake.WithPhaseObserver(ctx, func(name string, elapsed time.Duration) {
+			mu.Lock()
+			totals[name] += elapsed
+			counts[name]++
+			mu.Unlock()
+		})
+		t.Cleanup(func() {
+			mu.Lock()
+			defer mu.Unlock()
+			for name, elapsed := range totals {
+				t.Logf("SNOWFLAKE_PHASE phase=%s count=%d service_ms=%.3f", name, counts[name], float64(elapsed)/float64(time.Millisecond))
+			}
+		})
+	}
 	if err := itest.ResetTables(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +188,9 @@ func TestSnowflakeOnlineBackfillCrashRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink1.crash()
-	if err := sink1.wait(); err != nil {
+	// A crash can interrupt either Kafka polling or an in-flight warehouse
+	// statement. Both cancellation points are expected; other errors are not.
+	if err := sink1.wait(); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	if _, err := source.Exec(ctx, `DELETE FROM accounts WHERE id BETWEEN 41 AND 60`); err != nil {

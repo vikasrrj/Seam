@@ -177,6 +177,7 @@ func (s *Store) NextOffset(ctx context.Context) (int64, error) {
 }
 
 func (s *Store) ApplyTransaction(ctx context.Context, lease *SinkLease, transaction *kafka.Transaction) (retErr error) {
+	defer startPhase(ctx, "cdc-apply-total")()
 	if lease == nil {
 		return fmt.Errorf("Snowflake apply requires a sink lease")
 	}
@@ -186,11 +187,15 @@ func (s *Store) ApplyTransaction(ctx context.Context, lease *SinkLease, transact
 	if transaction.FirstOffset < 0 || transaction.FinalOffset < transaction.FirstOffset {
 		return fmt.Errorf("invalid Kafka transaction offset range %d..%d", transaction.FirstOffset, transaction.FinalOffset)
 	}
-	fingerprint, eventCount, lsn, err := s.validateAndFingerprint(transaction)
+	finishValidation := startPhase(ctx, "cdc-validate-fingerprint")
+	fingerprint, eventCount, rowCount, lsn, err := s.validateAndFingerprint(transaction)
+	finishValidation()
 	if err != nil {
 		return err
 	}
+	finishBegin := startPhase(ctx, "cdc-begin-transaction")
 	tx, err := s.db.BeginTx(ctx, nil)
+	finishBegin()
 	if err != nil {
 		return fmt.Errorf("begin Snowflake apply transaction: %w", err)
 	}
@@ -201,18 +206,22 @@ func (s *Store) ApplyTransaction(ctx context.Context, lease *SinkLease, transact
 	}()
 
 	sourceTx := transaction.Source.String()
+	finishControlReads := startPhase(ctx, "cdc-ledger-frontier-read")
 	var applied *appliedTransaction
 	var previous appliedTransaction
 	err = tx.QueryRowContext(ctx, "SELECT FIRST_OFFSET, FINAL_OFFSET, EVENT_COUNT, TX_FINGERPRINT FROM "+s.cfg.internal("APPLIED_TRANSACTIONS")+" WHERE STREAM_ID = ? AND SOURCE_TX = ?", s.cfg.StreamID, sourceTx).Scan(&previous.firstOffset, &previous.finalOffset, &previous.eventCount, &previous.fingerprint)
 	if err == nil {
 		applied = &previous
 	} else if !errors.Is(err, sql.ErrNoRows) {
+		finishControlReads()
 		return fmt.Errorf("check applied Snowflake transaction: %w", err)
 	}
 	var nextOffset int64
 	if err := tx.QueryRowContext(ctx, "SELECT NEXT_OFFSET FROM "+s.cfg.internal("OFFSETS")+" WHERE STREAM_ID = ?", s.cfg.StreamID).Scan(&nextOffset); err != nil {
+		finishControlReads()
 		return fmt.Errorf("read Snowflake apply frontier: %w", err)
 	}
+	finishControlReads()
 	action, err := classifyReplay(nextOffset, transaction, eventCount, fingerprint, applied)
 	if err != nil {
 		return err
@@ -221,14 +230,20 @@ func (s *Store) ApplyTransaction(ctx context.Context, lease *SinkLease, transact
 		return tx.Rollback()
 	}
 	if action == replayAdvanceOnly {
-		if err := s.fenceSinkLease(ctx, tx, lease); err != nil {
-			return err
+		finishFence := startPhase(ctx, "cdc-lease-fence")
+		fenceErr := s.fenceSinkLease(ctx, tx, lease)
+		finishFence()
+		if fenceErr != nil {
+			return fenceErr
 		}
 		if err := advanceOffset(ctx, tx, s.cfg, transaction.FirstOffset, transaction.FinalOffset+1); err != nil {
 			return err
 		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit Snowflake replay frontier: %w", err)
+		finishCommit := startPhase(ctx, "cdc-commit")
+		commitErr := tx.Commit()
+		finishCommit()
+		if commitErr != nil {
+			return fmt.Errorf("commit Snowflake replay frontier: %w", commitErr)
 		}
 		return nil
 	}
@@ -237,7 +252,9 @@ func (s *Store) ApplyTransaction(ctx context.Context, lease *SinkLease, transact
 		return err
 	}
 
+	finishRoutes := startPhase(ctx, "cdc-active-routes-read")
 	routes, err := activeRoutes(ctx, tx, s.cfg)
+	finishRoutes()
 	if err != nil {
 		return err
 	}
@@ -248,34 +265,57 @@ func (s *Store) ApplyTransaction(ctx context.Context, lease *SinkLease, transact
 		if !identifierPattern.MatchString(route.Table) {
 			return fmt.Errorf("route %q contains invalid target table %q", route.ID, route.Table)
 		}
+		if rowCount == 0 {
+			continue
+		}
 		mergeSQL, err := mergeTargetSQL(s.cfg, s.schema, route.Table)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, mergeSQL, batchID, s.cfg.StreamID, route.ID); err != nil {
-			return fmt.Errorf("merge Snowflake route %q: %w", route.ID, err)
+		finishMerge := startPhase(ctx, "cdc-target-merge")
+		_, mergeErr := tx.ExecContext(ctx, mergeSQL, batchID, s.cfg.StreamID, route.ID)
+		finishMerge()
+		if mergeErr != nil {
+			return fmt.Errorf("merge Snowflake route %q: %w", route.ID, mergeErr)
 		}
-		if _, err := tx.ExecContext(ctx, mergeClocksSQL(s.cfg), batchID, s.cfg.StreamID, route.ID, s.cfg.StreamID, route.ID); err != nil {
-			return fmt.Errorf("advance Snowflake key clocks for route %q: %w", route.ID, err)
+		finishClocks := startPhase(ctx, "cdc-key-clocks")
+		_, clockErr := tx.ExecContext(ctx, mergeClocksSQL(s.cfg), batchID, s.cfg.StreamID, route.ID, s.cfg.StreamID, route.ID)
+		finishClocks()
+		if clockErr != nil {
+			return fmt.Errorf("advance Snowflake key clocks for route %q: %w", route.ID, clockErr)
 		}
 	}
 	// Touch the lease row after all potentially long staging and MERGE work.
 	// A takeover updates the same row, so either this transaction proves its
 	// still-live epoch before committing, or every data effect rolls back.
-	if err := s.fenceSinkLease(ctx, tx, lease); err != nil {
-		return err
+	finishFence := startPhase(ctx, "cdc-lease-fence")
+	fenceErr := s.fenceSinkLease(ctx, tx, lease)
+	finishFence()
+	if fenceErr != nil {
+		return fenceErr
 	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO "+s.cfg.internal("APPLIED_TRANSACTIONS")+" (STREAM_ID, SOURCE_TX, FIRST_OFFSET, FINAL_OFFSET, EVENT_COUNT, TX_FINGERPRINT) VALUES (?, ?, ?, ?, ?, ?)", s.cfg.StreamID, sourceTx, transaction.FirstOffset, transaction.FinalOffset, eventCount, fingerprint); err != nil {
-		return fmt.Errorf("record applied Snowflake transaction: %w", err)
+	finishLedger := startPhase(ctx, "cdc-ledger-insert")
+	_, ledgerErr := tx.ExecContext(ctx, "INSERT INTO "+s.cfg.internal("APPLIED_TRANSACTIONS")+" (STREAM_ID, SOURCE_TX, FIRST_OFFSET, FINAL_OFFSET, EVENT_COUNT, TX_FINGERPRINT) VALUES (?, ?, ?, ?, ?, ?)", s.cfg.StreamID, sourceTx, transaction.FirstOffset, transaction.FinalOffset, eventCount, fingerprint)
+	finishLedger()
+	if ledgerErr != nil {
+		return fmt.Errorf("record applied Snowflake transaction: %w", ledgerErr)
 	}
 	if err := advanceOffset(ctx, tx, s.cfg, transaction.FirstOffset, transaction.FinalOffset+1); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM "+s.cfg.internal("CDC_STAGE")+" WHERE BATCH_ID = ?", batchID); err != nil {
-		return fmt.Errorf("clear Snowflake CDC stage: %w", err)
+	if rowCount > 0 {
+		finishCleanup := startPhase(ctx, "cdc-stage-cleanup")
+		_, cleanupErr := tx.ExecContext(ctx, "DELETE FROM "+s.cfg.internal("CDC_STAGE")+" WHERE BATCH_ID = ?", batchID)
+		finishCleanup()
+		if cleanupErr != nil {
+			return fmt.Errorf("clear Snowflake CDC stage: %w", cleanupErr)
+		}
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit Snowflake apply transaction: %w", err)
+	finishCommit := startPhase(ctx, "cdc-commit")
+	commitErr := tx.Commit()
+	finishCommit()
+	if commitErr != nil {
+		return fmt.Errorf("commit Snowflake apply transaction: %w", commitErr)
 	}
 	return nil
 }
@@ -315,6 +355,7 @@ func classifyReplay(frontier int64, transaction *kafka.Transaction, eventCount i
 }
 
 func advanceOffset(ctx context.Context, tx *sql.Tx, cfg Config, from, to int64) error {
+	defer startPhase(ctx, "cdc-frontier-cas")()
 	result, err := tx.ExecContext(ctx, "UPDATE "+cfg.internal("OFFSETS")+" SET NEXT_OFFSET = ?, UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND NEXT_OFFSET = ?", to, cfg.StreamID, from)
 	if err != nil {
 		return fmt.Errorf("advance Snowflake apply frontier: %w", err)
@@ -330,15 +371,16 @@ func advanceOffset(ctx context.Context, tx *sql.Tx, cfg Config, from, to int64) 
 // validateAndFingerprint reads a replayable transaction without materializing
 // it. The fingerprint is independent of Kafka offsets, which are allowed to
 // change when capture republishes a PostgreSQL transaction after recovery.
-func (s *Store) validateAndFingerprint(transaction *kafka.Transaction) (string, int, uint64, error) {
+func (s *Store) validateAndFingerprint(transaction *kafka.Transaction) (string, int, int, uint64, error) {
 	lsn, err := parseLSN(transaction.Source.LSN)
 	if err != nil {
-		return "", 0, 0, err
+		return "", 0, 0, 0, err
 	}
 	h := sha256.New()
 	writeFingerprintString(h, "seam-snowflake-transaction-v1")
 	writeSourceFingerprint(h, transaction.Source)
 	eventCount := 0
+	rowCount := 0
 	err = transaction.Walk(func(records []kafka.Record) error {
 		for _, record := range records {
 			change := record.Change
@@ -347,16 +389,19 @@ func (s *Store) validateAndFingerprint(transaction *kafka.Transaction) (string, 
 			}
 			writeChangeFingerprint(h, &change)
 			eventCount++
+			if change.Row != nil {
+				rowCount++
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return "", 0, 0, err
+		return "", 0, 0, 0, err
 	}
 	if eventCount != transaction.TotalCount || eventCount <= 0 {
-		return "", 0, 0, fmt.Errorf("transaction %s contains %d events, envelope declares %d", transaction.Source, eventCount, transaction.TotalCount)
+		return "", 0, 0, 0, fmt.Errorf("transaction %s contains %d events, envelope declares %d", transaction.Source, eventCount, transaction.TotalCount)
 	}
-	return hex.EncodeToString(h.Sum(nil)), eventCount, lsn, nil
+	return hex.EncodeToString(h.Sum(nil)), eventCount, rowCount, lsn, nil
 }
 
 func (s *Store) validateChange(source model.SourceTx, change *model.Change) error {
@@ -393,6 +438,7 @@ type stagedChange struct {
 }
 
 func (s *Store) stageTransaction(ctx context.Context, tx *sql.Tx, transaction *kafka.Transaction, batchID, sourceTx string, lsn uint64) error {
+	defer startPhase(ctx, "cdc-stage-transaction")()
 	sequence := int64(0)
 	batch := make([]stagedChange, 0, stageBatchRows)
 	batchBytes := 0

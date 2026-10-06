@@ -20,8 +20,6 @@ import (
 
 const (
 	bulkFilePrepared = "prepared"
-	bulkFileUploaded = "uploaded"
-	bulkFileLoaded   = "loaded"
 )
 
 type snapshotFile struct {
@@ -52,7 +50,9 @@ func (s *Store) stageSnapshotBulk(ctx context.Context, lease *ChunkLease, rows [
 	if len(rows) == 0 {
 		return s.stageEmptySnapshot(ctx, lease)
 	}
+	finishFile := startPhase(ctx, "snapshot-file-encode-gzip-write")
 	file, err := s.writeSnapshotFile(lease, rows)
+	finishFile()
 	if err != nil {
 		return err
 	}
@@ -158,29 +158,33 @@ func (s *Store) writeSnapshotFile(lease *ChunkLease, rows []model.Row) (_ *snaps
 }
 
 func (s *Store) prepareSnapshotFile(ctx context.Context, lease *ChunkLease, file *snapshotFile) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	defer startPhase(ctx, "snapshot-manifest-prepare")()
+	query := "MERGE INTO " + s.cfg.internal("BACKFILL_FILES") + " D USING (SELECT ? AS STREAM_ID, ? AS JOB_ID, ? AS ATTEMPT, ? AS CHUNK_MIN, ? AS LEASE_TOKEN, ? AS FILE_ID, ? AS STAGE_PATH, ? AS CONTENT_SHA256, ? AS ROW_COUNT, ? AS BYTE_COUNT, ? AS STATE WHERE EXISTS (SELECT 1 FROM " + s.cfg.internal("BACKFILL_CHUNKS") + " C WHERE C.STREAM_ID = ? AND C.JOB_ID = ? AND C.ATTEMPT = ? AND C.CHUNK_MIN = ? AND C.CHUNK_MAX = ? AND C.LEASE_OWNER = ? AND C.LEASE_TOKEN = ? AND C.LEASE_EXPIRES > CURRENT_TIMESTAMP() AND C.STATE = ?)) S ON D.STREAM_ID = S.STREAM_ID AND D.JOB_ID = S.JOB_ID AND D.ATTEMPT = S.ATTEMPT AND D.CHUNK_MIN = S.CHUNK_MIN AND D.LEASE_TOKEN = S.LEASE_TOKEN AND D.FILE_ID = S.FILE_ID WHEN MATCHED THEN UPDATE SET STAGE_PATH = S.STAGE_PATH, CONTENT_SHA256 = S.CONTENT_SHA256, ROW_COUNT = S.ROW_COUNT, BYTE_COUNT = S.BYTE_COUNT, STATE = S.STATE, UPDATED_AT = CURRENT_TIMESTAMP() WHEN NOT MATCHED THEN INSERT (STREAM_ID, JOB_ID, ATTEMPT, CHUNK_MIN, LEASE_TOKEN, FILE_ID, STAGE_PATH, CONTENT_SHA256, ROW_COUNT, BYTE_COUNT, STATE) VALUES (S.STREAM_ID, S.JOB_ID, S.ATTEMPT, S.CHUNK_MIN, S.LEASE_TOKEN, S.FILE_ID, S.STAGE_PATH, S.CONTENT_SHA256, S.ROW_COUNT, S.BYTE_COUNT, S.STATE)"
+	result, err := s.db.ExecContext(ctx, query,
+		s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.LeaseToken,
+		file.ID, file.StagePath, file.ContentSHA256, file.Rows, file.Bytes, bulkFilePrepared,
+		s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.Range.Max,
+		lease.WorkerID, lease.LeaseToken, string(model.ChunkScanning))
 	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := validateSnapshotLease(ctx, tx, s.cfg, lease); err != nil {
-		return err
-	}
-	query := "MERGE INTO " + s.cfg.internal("BACKFILL_FILES") + " D USING (SELECT ? AS STREAM_ID, ? AS JOB_ID, ? AS ATTEMPT, ? AS CHUNK_MIN, ? AS LEASE_TOKEN, ? AS FILE_ID, ? AS STAGE_PATH, ? AS CONTENT_SHA256, ? AS ROW_COUNT, ? AS BYTE_COUNT) S ON D.STREAM_ID = S.STREAM_ID AND D.JOB_ID = S.JOB_ID AND D.ATTEMPT = S.ATTEMPT AND D.CHUNK_MIN = S.CHUNK_MIN AND D.LEASE_TOKEN = S.LEASE_TOKEN AND D.FILE_ID = S.FILE_ID WHEN MATCHED THEN UPDATE SET STAGE_PATH = S.STAGE_PATH, CONTENT_SHA256 = S.CONTENT_SHA256, ROW_COUNT = S.ROW_COUNT, BYTE_COUNT = S.BYTE_COUNT, UPDATED_AT = CURRENT_TIMESTAMP() WHEN NOT MATCHED THEN INSERT (STREAM_ID, JOB_ID, ATTEMPT, CHUNK_MIN, LEASE_TOKEN, FILE_ID, STAGE_PATH, CONTENT_SHA256, ROW_COUNT, BYTE_COUNT, STATE) VALUES (S.STREAM_ID, S.JOB_ID, S.ATTEMPT, S.CHUNK_MIN, S.LEASE_TOKEN, S.FILE_ID, S.STAGE_PATH, S.CONTENT_SHA256, S.ROW_COUNT, S.BYTE_COUNT, ?)"
-	if _, err := tx.ExecContext(ctx, query, s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.LeaseToken, file.ID, file.StagePath, file.ContentSHA256, file.Rows, file.Bytes, bulkFilePrepared); err != nil {
 		return fmt.Errorf("record prepared Snowflake snapshot file: %w", err)
 	}
-	return tx.Commit()
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		return fmt.Errorf("prepare Snowflake chunk %s: lease expired or was fenced", lease.Range)
+	}
+	return nil
 }
 
 func (s *Store) uploadSnapshotFile(ctx context.Context, lease *ChunkLease, file *snapshotFile) error {
+	defer startPhase(ctx, "snapshot-upload")()
 	absolute, err := filepath.Abs(file.LocalPath)
 	if err != nil {
 		return err
 	}
 	fileURI := "file://" + filepath.ToSlash(absolute)
 	query := "PUT '" + strings.ReplaceAll(fileURI, "'", "''") + "' " + file.StageDirectory + " AUTO_COMPRESS = FALSE OVERWRITE = TRUE PARALLEL = " + strconv.Itoa(s.cfg.UploadParallel)
+	finishPut := startPhase(ctx, "snapshot-put-submit")
 	result, err := s.db.QueryContext(ctx, query)
+	finishPut()
 	if err != nil {
 		return fmt.Errorf("upload Snowflake snapshot file: %w", err)
 	}
@@ -207,14 +211,9 @@ func (s *Store) uploadSnapshotFile(ctx context.Context, lease *ChunkLease, file 
 	if uploaded != 1 {
 		return fmt.Errorf("upload Snowflake snapshot file returned %d results, expected 1", uploaded)
 	}
-	update := "UPDATE " + s.cfg.internal("BACKFILL_FILES") + " F SET STATE = ?, UPDATED_AT = CURRENT_TIMESTAMP() WHERE F.STREAM_ID = ? AND F.JOB_ID = ? AND F.ATTEMPT = ? AND F.CHUNK_MIN = ? AND F.LEASE_TOKEN = ? AND F.FILE_ID = ? AND EXISTS (SELECT 1 FROM " + s.cfg.internal("BACKFILL_CHUNKS") + " C WHERE C.STREAM_ID = F.STREAM_ID AND C.JOB_ID = F.JOB_ID AND C.ATTEMPT = F.ATTEMPT AND C.CHUNK_MIN = F.CHUNK_MIN AND C.LEASE_TOKEN = F.LEASE_TOKEN AND C.LEASE_OWNER = ? AND C.LEASE_EXPIRES > CURRENT_TIMESTAMP() AND C.STATE = ?)"
-	changed, err := s.db.ExecContext(ctx, update, bulkFileUploaded, s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.LeaseToken, file.ID, lease.WorkerID, string(model.ChunkScanning))
-	if err != nil {
-		return err
-	}
-	if affected, err := changed.RowsAffected(); err != nil || affected != 1 {
-		return fmt.Errorf("upload Snowflake chunk %s: lease expired or was fenced", lease.Range)
-	}
+	// Keep the durable manifest in prepared. COPY and chunk progress commit
+	// atomically, so a crash after PUT safely repeats the same content-addressed
+	// OVERWRITE upload without another manifest state transition.
 	return nil
 }
 
@@ -241,42 +240,98 @@ func (s *Store) stageEmptySnapshot(ctx context.Context, lease *ChunkLease) error
 }
 
 func (s *Store) copySnapshotFile(ctx context.Context, lease *ChunkLease, file *snapshotFile) error {
+	defer startPhase(ctx, "snapshot-copy-transaction")()
+	finishBegin := startPhase(ctx, "snapshot-copy-begin")
 	tx, err := s.db.BeginTx(ctx, nil)
+	finishBegin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateSnapshotLease(ctx, tx, s.cfg, lease); err != nil {
-		return err
+	finishLease := startPhase(ctx, "snapshot-copy-lease-read")
+	leaseErr := validateSnapshotLease(ctx, tx, s.cfg, lease)
+	finishLease()
+	if leaseErr != nil {
+		return leaseErr
 	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM "+s.cfg.internal("SNAPSHOT_STAGE")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min); err != nil {
-		return err
+	finishDelete := startPhase(ctx, "snapshot-copy-stage-delete")
+	_, deleteErr := tx.ExecContext(ctx, "DELETE FROM "+s.cfg.internal("SNAPSHOT_STAGE")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min)
+	finishDelete()
+	if deleteErr != nil {
+		return deleteErr
 	}
-	if _, err := tx.ExecContext(ctx, bulkCopySQL(s.cfg, file.StageDirectory)); err != nil {
-		return fmt.Errorf("copy Snowflake snapshot file: %w", err)
+	finishCopy := startPhase(ctx, "snapshot-copy-statement")
+	loaded, copyErr := copySnapshotRows(ctx, tx, bulkCopySQL(s.cfg, file.StageDirectory))
+	finishCopy()
+	if copyErr != nil {
+		return fmt.Errorf("copy Snowflake snapshot file: %w", copyErr)
 	}
-	var loaded int
-	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+s.cfg.internal("SNAPSHOT_STAGE")+" WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ?", s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min).Scan(&loaded); err != nil {
-		return err
-	}
-	if loaded != file.Rows {
+	if loaded != int64(file.Rows) {
 		return fmt.Errorf("Snowflake snapshot file loaded %d rows, expected %d", loaded, file.Rows)
 	}
-	result, err := tx.ExecContext(ctx, "UPDATE "+s.cfg.internal("BACKFILL_FILES")+" SET STATE = ?, UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ? AND LEASE_TOKEN = ? AND FILE_ID = ? AND STATE IN (?, ?)", bulkFileLoaded, s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.LeaseToken, file.ID, bulkFilePrepared, bulkFileUploaded)
-	if err != nil {
-		return err
-	}
-	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
-		return fmt.Errorf("Snowflake snapshot file %q manifest changed while loading", file.ID)
-	}
-	result, err = tx.ExecContext(ctx, "UPDATE "+s.cfg.internal("BACKFILL_CHUNKS")+" SET ROWS_SCANNED = ?, UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ? AND LEASE_OWNER = ? AND LEASE_TOKEN = ? AND LEASE_EXPIRES > CURRENT_TIMESTAMP() AND STATE = ?", file.Rows, s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.WorkerID, lease.LeaseToken, string(model.ChunkScanning))
+	finishProgress := startPhase(ctx, "snapshot-copy-progress-update")
+	result, err := tx.ExecContext(ctx, "UPDATE "+s.cfg.internal("BACKFILL_CHUNKS")+" SET ROWS_SCANNED = ?, UPDATED_AT = CURRENT_TIMESTAMP() WHERE STREAM_ID = ? AND JOB_ID = ? AND ATTEMPT = ? AND CHUNK_MIN = ? AND LEASE_OWNER = ? AND LEASE_TOKEN = ? AND LEASE_EXPIRES > CURRENT_TIMESTAMP() AND STATE = ?", file.Rows, s.cfg.StreamID, lease.JobID, lease.Attempt, lease.Range.Min, lease.WorkerID, lease.LeaseToken, string(model.ChunkScanning))
+	finishProgress()
 	if err != nil {
 		return err
 	}
 	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
 		return fmt.Errorf("copy Snowflake chunk %s: lease expired or was fenced", lease.Range)
 	}
-	return tx.Commit()
+	finishCommit := startPhase(ctx, "snapshot-copy-commit")
+	commitErr := tx.Commit()
+	finishCommit()
+	return commitErr
+}
+
+// copySnapshotRows reads Snowflake's COPY result instead of issuing a second
+// COUNT query. The result's rows_loaded value is the warehouse's authoritative
+// count for the exact staged file and remains inside the surrounding atomic
+// transaction.
+func copySnapshotRows(ctx context.Context, tx *sql.Tx, query string) (int64, error) {
+	rows, err := tx.QueryContext(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return 0, err
+	}
+	loadedColumn := -1
+	for index, column := range columns {
+		if strings.EqualFold(column, "rows_loaded") {
+			loadedColumn = index
+			break
+		}
+	}
+	if loadedColumn < 0 {
+		return 0, fmt.Errorf("COPY result has no rows_loaded column")
+	}
+	values := make([]any, len(columns))
+	destinations := make([]any, len(columns))
+	for index := range values {
+		destinations[index] = &values[index]
+	}
+	var loaded int64
+	for rows.Next() {
+		if err := rows.Scan(destinations...); err != nil {
+			return 0, err
+		}
+		value := values[loadedColumn]
+		if bytes, ok := value.([]byte); ok {
+			value = string(bytes)
+		}
+		count, err := strconv.ParseInt(fmt.Sprint(value), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse COPY rows_loaded value %q: %w", value, err)
+		}
+		loaded += count
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return loaded, nil
 }
 
 func validateSnapshotLease(ctx context.Context, tx *sql.Tx, cfg Config, lease *ChunkLease) error {

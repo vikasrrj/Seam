@@ -38,6 +38,91 @@ type stubProducer struct {
 	errs    []error
 }
 
+type benchmarkProducer struct {
+	records int
+	bytes   int
+}
+
+func (p *benchmarkProducer) ProduceSync(_ context.Context, record *kgo.Record) error {
+	p.records++
+	p.bytes += len(record.Value)
+	return nil
+}
+
+func (*benchmarkProducer) Close() {}
+
+func BenchmarkPublishTransaction1000Rows(b *testing.B) {
+	const rows = 1000
+	var totalBytes int
+	b.ReportAllocs()
+	for range b.N {
+		b.StopTimer()
+		decoder := NewDecoder("gen:0", accountsDescriptor())
+		decoder.SetSystemID("source-1")
+		if _, err := decoder.Handle(accountsRelation()); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := decoder.Handle(&pglogrepl.BeginMessage{FinalLSN: 200, Xid: 42}); err != nil {
+			b.Fatal(err)
+		}
+		for index := 0; index < rows; index++ {
+			if _, err := decoder.Handle(&pglogrepl.InsertMessage{
+				RelationID: 1,
+				Tuple:      textTuple(itoa(int64(index+1)), "owner", "100"),
+			}); err != nil {
+				b.Fatal(err)
+			}
+		}
+		tx, err := decoder.Handle(commitTx(600))
+		if err != nil {
+			b.Fatal(err)
+		}
+		producer := &benchmarkProducer{}
+		reader := &Reader{
+			cfg: ReaderConfig{KafkaTopic: "seam.test"}, producer: producer,
+			decoder: decoder, schemaID: accountsDescriptor().Fingerprint, codec: JSONCodec{},
+		}
+		b.StartTimer()
+		if err := reader.publishTransaction(context.Background(), tx); err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+		if producer.records != 1 {
+			b.Fatalf("produced %d records, want 1", producer.records)
+		}
+		totalBytes += producer.bytes
+	}
+	b.ReportMetric(float64(totalBytes)/float64(b.N), "wire-bytes/op")
+}
+
+func TestTransactionFragmentSizeIsExact(t *testing.T) {
+	reader := &Reader{schemaID: accountsDescriptor().Fingerprint, codec: JSONCodec{}}
+	changes := []model.Change{
+		{Op: model.OpInsert, Source: model.SourceTx{SystemID: "source-1", Generation: "gen:0", LSN: "0/1", XID: 7}, Row: accountRow(1, `quoted "owner"`, 100)},
+		{Op: model.OpDelete, Source: model.SourceTx{SystemID: "source-1", Generation: "gen:0", LSN: "0/1", XID: 7}, Row: accountRow(2, "slash\\owner", 200)},
+	}
+	encodedChanges := 0
+	for _, change := range changes {
+		payload, err := reader.codec.Encode(change)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encodedChanges += len(payload)
+	}
+	envelope := reader.transactionFragment(changes, 3, true, len(changes))
+	payload, err := reader.codec.EncodeTransaction(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	predicted, err := reader.transactionFragmentSize(changes[0].Source, 3, true, len(changes), len(changes), encodedChanges)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if predicted != len(payload) {
+		t.Fatalf("predicted payload bytes = %d, actual = %d", predicted, len(payload))
+	}
+}
+
 // newGateProducer returns a producer that blocks every ProduceSync on a
 // release channel, and the channel it signals on when a produce begins.
 func newGateProducer(errs ...error) (*stubProducer, chan struct{}) {

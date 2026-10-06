@@ -301,6 +301,7 @@ func (r *Reader) handleMessage(ctx context.Context, message pglogrepl.Message, w
 func (r *Reader) publishTransaction(ctx context.Context, tx *CommittedTransaction) error {
 	fragmentIndex := 0
 	changes := make([]model.Change, 0, 128)
+	changeBytes := 0
 	for {
 		change, ok, err := r.decoder.NextEvent()
 		if err != nil {
@@ -316,26 +317,58 @@ func (r *Reader) publishTransaction(ctx context.Context, tx *CommittedTransactio
 			}
 			return nil
 		}
-		changes = append(changes, change)
-		probe := r.transactionFragment(changes, fragmentIndex, false, tx.Count)
-		payload, err := r.codec.EncodeTransaction(probe)
+		encodedChange, err := r.codec.Encode(change)
 		if err != nil {
-			return fmt.Errorf("encode transaction fragment: %w", err)
+			return fmt.Errorf("encode transaction change: %w", err)
 		}
-		if len(payload) <= maxKafkaTransactionBytes {
+		changes = append(changes, change)
+		changeBytes += len(encodedChange)
+		payloadBytes, err := r.transactionFragmentSize(changes[0].Source, fragmentIndex, false, tx.Count, len(changes), changeBytes)
+		if err != nil {
+			return err
+		}
+		if payloadBytes <= maxKafkaTransactionBytes {
 			continue
 		}
 		if len(changes) == 1 {
-			return fmt.Errorf("transaction %s contains one change encoding to %d bytes, exceeding Kafka record limit %d; source LSN will not be acknowledged", change.Source, len(payload), maxKafkaTransactionBytes)
+			return fmt.Errorf("transaction %s contains one change encoding to %d bytes, exceeding Kafka record limit %d; source LSN will not be acknowledged", change.Source, payloadBytes, maxKafkaTransactionBytes)
 		}
 		last := changes[len(changes)-1]
 		changes = changes[:len(changes)-1]
+		changeBytes -= len(encodedChange)
 		if err := r.publish(ctx, r.transactionFragment(changes, fragmentIndex, false, tx.Count)); err != nil {
 			return err
 		}
 		fragmentIndex++
 		changes = []model.Change{last}
+		changeBytes = len(encodedChange)
+		payloadBytes, err = r.transactionFragmentSize(last.Source, fragmentIndex, false, tx.Count, 1, changeBytes)
+		if err != nil {
+			return err
+		}
+		if payloadBytes > maxKafkaTransactionBytes {
+			return fmt.Errorf("transaction %s contains one change encoding to %d bytes, exceeding Kafka record limit %d; source LSN will not be acknowledged", last.Source, payloadBytes, maxKafkaTransactionBytes)
+		}
 	}
+}
+
+// transactionFragmentSize returns the exact JSON wire size without repeatedly
+// encoding every change accumulated in the fragment. Encoding an envelope with
+// a nil Changes slice yields the same JSON with "null" in place of the final
+// array; each change's standalone encoding is byte-identical inside that array.
+func (r *Reader) transactionFragmentSize(source model.SourceTx, index int, final bool, total, count, encodedChanges int) (int, error) {
+	metadata, err := r.codec.EncodeTransaction(model.TransactionEnvelope{
+		Version: 2, SchemaID: r.schemaID, Source: source, FragmentIndex: index,
+		Final: final, Count: count, TotalCount: total,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("encode transaction fragment metadata: %w", err)
+	}
+	separators := count - 1
+	if separators < 0 {
+		separators = 0
+	}
+	return len(metadata) - len("null") + len("[]") + encodedChanges + separators, nil
 }
 
 func (r *Reader) transactionFragment(changes []model.Change, index int, final bool, total int) model.TransactionEnvelope {
